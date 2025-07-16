@@ -1,57 +1,33 @@
 /*---------------------------------------------------------------*/
-/* 5-bis.  build “full” tables so we have actual + prediction    */
-/*        for each stage separately                              */
+/* 6. call your metrics macro with log tracking                  */
 /*---------------------------------------------------------------*/
 
-/* === HIST =====================================================*/
-data &outprefix.stg1_hist_full;
-    merge &score_hist(keep=&id_var lgd_stage1)   /* actual flag  */
-          &outprefix.stg1_hist ;                 /* p_loss       */
-    by &id_var;
-run;
-
-data &outprefix.stg2_hist_full;
-    merge &score_hist(keep=&id_var &lgd_var)     /* actual LGD   */
-          &outprefix.stg2_hist ;                 /* p_lgd        */
-    by &id_var;
-run;
-
-/* === OOT ======================================================*/
-data &outprefix.stg1_oot_full;
-    merge &score_oot (keep=&id_var lgd_stage1)
-          &outprefix.stg1_oot ;
-    by &id_var;
-run;
-
-data &outprefix.stg2_oot_full;
-    merge &score_oot (keep=&id_var &lgd_var)
-          &outprefix.stg2_oot ;
-    by &id_var;
-run;
-
-/*---------------------------------------------------------------*/
-/* 6. call your metrics macro                                    */
-/*---------------------------------------------------------------*/
+%put NOTE: evaluating stage 1 model performance on HISTORICAL data;
 %performance_metrics(data_=&outprefix.stg1_hist_full ,
                      actual_var = lgd_stage1 ,
                      pred_var   = p_loss       );
 
+%put NOTE: evaluating stage 2 model performance on HISTORICAL data;
 %performance_metrics(data_=&outprefix.stg2_hist_full ,
                      actual_var = &lgd_var     ,
                      pred_var   = p_lgd        );
 
+%put NOTE: evaluating final scored model performance on HISTORICAL data;
 %performance_metrics(data_=&outprefix.scored_hist   ,
                      actual_var = &lgd_var     ,
                      pred_var   = pred_lgd     );
 
+%put NOTE: evaluating stage 1 model performance on OOT data;
 %performance_metrics(data_=&outprefix.stg1_oot_full ,
                      actual_var = lgd_stage1 ,
                      pred_var   = p_loss       );
 
+%put NOTE: evaluating stage 2 model performance on OOT data;
 %performance_metrics(data_=&outprefix.stg2_oot_full ,
                      actual_var = &lgd_var     ,
                      pred_var   = p_lgd        );
 
+%put NOTE: evaluating final scored model performance on OOT data;
 %performance_metrics(data_=&outprefix.scored_oot    ,
                      actual_var = &lgd_var     ,
                      pred_var   = pred_lgd     );
