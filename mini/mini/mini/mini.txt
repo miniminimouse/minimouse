@@ -1,33 +1,97 @@
-/*---------------------------------------------------------------*/
-/* 6. call your metrics macro with log tracking                  */
-/*---------------------------------------------------------------*/
+/*==============================================================*/
+/* LGD two-stage – train, score, metrics                        */
+/*==============================================================*/
+%macro twostage_lgd(
+      stage1_data =
+    , stage2_data =
+    , score_hist  =
+    , score_oot   =
+    , id_var      = loan_number
+    , date_var    = def_date
+    , lgd_var     = lgd_36m
+    , stage1_vars =
+    , stage2_vars =
+    , outprefix   = tg_
+);
 
-%put NOTE: evaluating stage 1 model performance on HISTORICAL data;
-%performance_metrics(data_=&outprefix.stg1_hist_full ,
-                     actual_var = lgd_stage1 ,
-                     pred_var   = p_loss       );
+/* 1 ───────── stage-1 fit */
+proc logistic data=&stage1_data outmodel=&outprefix.bout1 noprint;
+    model lgd_stage1(event='1') = &stage1_vars / link=logit;
+run;
 
-%put NOTE: evaluating stage 2 model performance on HISTORICAL data;
-%performance_metrics(data_=&outprefix.stg2_hist_full ,
-                     actual_var = &lgd_var     ,
-                     pred_var   = p_lgd        );
+/* 2 ───────── stage-2 fit */
+proc logistic data=&stage2_data outmodel=&outprefix.bout2 noprint;
+    model algd_adj(event='1')   = &stage2_vars / link=logit;
+    weight wt;
+run;
 
-%put NOTE: evaluating final scored model performance on HISTORICAL data;
-%performance_metrics(data_=&outprefix.scored_hist   ,
-                     actual_var = &lgd_var     ,
-                     pred_var   = pred_lgd     );
+/* helper to score one model */
+%macro _score_one(inmodel=, data=, out=, prob=);
+    proc logistic inmodel=&inmodel noprint;
+        score data=&data out=&out(rename=(P_1=&prob)) fitstat;
+    run;
+    data &out; set &out(keep=&id_var &prob); run;
+%mend;
 
-%put NOTE: evaluating stage 1 model performance on OOT data;
-%performance_metrics(data_=&outprefix.stg1_oot_full ,
-                     actual_var = lgd_stage1 ,
-                     pred_var   = p_loss       );
+/* 3 ───────── score HIST */
+%_score_one(inmodel=&outprefix.bout1, data=&score_hist ,
+            out=&outprefix.s1_hist , prob=p_loss );
+%_score_one(inmodel=&outprefix.bout2, data=&score_hist ,
+            out=&outprefix.s2_hist , prob=p_lgd  );
 
-%put NOTE: evaluating stage 2 model performance on OOT data;
-%performance_metrics(data_=&outprefix.stg2_oot_full ,
-                     actual_var = &lgd_var     ,
-                     pred_var   = p_lgd        );
+proc sort data=&outprefix.s1_hist; by &id_var; run;
+proc sort data=&outprefix.s2_hist; by &id_var; run;
 
-%put NOTE: evaluating final scored model performance on OOT data;
-%performance_metrics(data_=&outprefix.scored_oot    ,
-                     actual_var = &lgd_var     ,
-                     pred_var   = pred_lgd     );
+data &outprefix.scored_hist;
+    merge &score_hist(in=src keep=&id_var &date_var &lgd_var) /* no lgd_stage1 */
+          &outprefix.s1_hist
+          &outprefix.s2_hist;
+    by &id_var;
+    pred_lgd = p_loss * p_lgd;
+run;
+
+/* 4 ───────── score OOT */
+%_score_one(inmodel=&outprefix.bout1, data=&score_oot ,
+            out=&outprefix.s1_oot  , prob=p_loss );
+%_score_one(inmodel=&outprefix.bout2, data=&score_oot ,
+            out=&outprefix.s2_oot  , prob=p_lgd  );
+
+proc sort data=&outprefix.s1_oot; by &id_var; run;
+proc sort data=&outprefix.s2_oot; by &id_var; run;
+
+data &outprefix.scored_oot;
+    merge &score_oot(in=src keep=&id_var &date_var &lgd_var)
+          &outprefix.s1_oot
+          &outprefix.s2_oot;
+    by &id_var;
+    pred_lgd = p_loss * p_lgd;
+run;
+
+/* 5 ───────── build “full” tables for metrics */
+data &outprefix.s2_hist_full; merge &score_hist(keep=&id_var &lgd_var)
+                                    &outprefix.s2_hist; by &id_var; run;
+data &outprefix.s2_oot_full ; merge &score_oot (keep=&id_var &lgd_var)
+                                    &outprefix.s2_oot ; by &id_var; run;
+
+/* 6 ───────── metrics */
+%put NOTE: metrics – stage-2 HIST;
+%performance_metrics(data_ =&outprefix.s2_hist_full ,
+                     actual_var =&lgd_var ,
+                     pred_var   = p_lgd    );
+
+%put NOTE: metrics – stage-2 OOT;
+%performance_metrics(data_ =&outprefix.s2_oot_full  ,
+                     actual_var =&lgd_var ,
+                     pred_var   = p_lgd    );
+
+%put NOTE: metrics – combined HIST;
+%performance_metrics(data_ =&outprefix.scored_hist  ,
+                     actual_var =&lgd_var ,
+                     pred_var   = pred_lgd );
+
+%put NOTE: metrics – combined OOT;
+%performance_metrics(data_ =&outprefix.scored_oot   ,
+                     actual_var =&lgd_var ,
+                     pred_var   = pred_lgd );
+
+%mend twostage_lgd;
