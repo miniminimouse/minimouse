@@ -1,102 +1,152 @@
 /*================================================================*/
-/*  twostage_lgd – two-stage LGD stack (no KEEP)                  */
+/*  twostage_lgd – two-stage LGD stack (FIXED)                   */
 /*================================================================*/
 %macro twostage_lgd(
-      stage1_data =
-    , stage2_data =
-    , score_hist  =
-    , score_oot   =
-    , id_var      = loan_number
-    , date_var    = def_date
-    , lgd_var     = lgd_36m
-    , stage1_vars =
-    , stage2_vars =
-    , outprefix   = tg_
+stage1_data =
+, stage2_data =
+, score_hist  =
+, score_oot   =
+, id_var      = loan_number
+, date_var    = def_date
+, lgd_var     = lgd_36m
+, stage1_vars =
+, stage2_vars =
+, outprefix   = tg_
 );
 
-/* 1. Stage-1 model – probability of loss ---------------------- */
+/* 1. Stage-1 model – probability of loss ––––––––––– */
 proc logistic data=&stage1_data outmodel=&outprefix.bout1;
-    model lgd_stage1(event='1') = &stage1_vars / link=logit;
+model lgd_stage1(event=‘1’) = &stage1_vars / link=logit;
 run;
 
-/* 2. Stage-2 model – E(LGD | loss) ---------------------------- */
+/* 2. Stage-2 model – E(LGD | loss) –––––––––––––– */
 proc logistic data=&stage2_data outmodel=&outprefix.bout2;
-    model algd_adj(event='1')   = &stage2_vars / link=logit;
-    weight wt;
+model algd_adj(event=‘1’) = &stage2_vars / link=logit;
+weight wt;
 run;
 
-/* helper: score one model, rename P_1 ------------------------- */
-%macro _score_one(inmodel=, data=, out=, prob=);
-    proc logistic inmodel=&inmodel;
-        score data=&data out=&out(rename=(P_1=&prob)) fitstat;
-    run;
-    data &out; set &out(keep=&id_var &prob); run;
-%mend;
+/* 3. Score HIST portfolio ———————————–– */
+/* Score Stage 1 model */
+proc logistic inmodel=&outprefix.bout1 noprint;
+score data=&score_hist out=&outprefix.s1_hist fitstat;
+run;
 
-/* 3. score HIST portfolio ------------------------------------- */
-%_score_one(inmodel=&outprefix.bout1, data=&score_hist,
-            out=&outprefix.s1_hist, prob=p_loss);
-%_score_one(inmodel=&outprefix.bout2, data=&score_hist,
-            out=&outprefix.s2_hist, prob=p_lgd );
+/* Score Stage 2 model */
+proc logistic inmodel=&outprefix.bout2 noprint;
+score data=&score_hist out=&outprefix.s2_hist fitstat;
+run;
 
+/* Sort both datasets */
 proc sort data=&outprefix.s1_hist; by &id_var; run;
 proc sort data=&outprefix.s2_hist; by &id_var; run;
 
+/* Create final scored dataset */
 data &outprefix.scored_hist;
-    merge &score_hist(in=src)   /* keep EVERYTHING               */
-          &outprefix.s1_hist
-          &outprefix.s2_hist;
-    by &id_var;
-    /* supply flags if missing */
-    if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
-    if missing(algd_adj ) then algd_adj  = (&lgd_var > 0);
-    pred_lgd = p_loss * p_lgd;
+merge &outprefix.s1_hist(rename=(P_1=p_loss) keep=&id_var P_1)
+&outprefix.s2_hist(rename=(P_1=p_lgd) keep=&id_var P_1);
+by &id_var;
 run;
 
-/* 4. score OOT portfolio -------------------------------------- */
-%_score_one(inmodel=&outprefix.bout1, data=&score_oot,
-            out=&outprefix.s1_oot, prob=p_loss);
-%_score_one(inmodel=&outprefix.bout2, data=&score_oot,
-            out=&outprefix.s2_oot, prob=p_lgd );
+/* Sort and merge with original data */
+proc sort data=&score_hist; by &id_var; run;
+proc sort data=&outprefix.scored_hist; by &id_var; run;
 
+data &outprefix.scored_hist;
+merge &score_hist &outprefix.scored_hist;
+by &id_var;
+
+```
+/* Create binary flags if missing */
+if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+
+/* Final prediction */
+pred_lgd = p_loss * p_lgd;
+```
+
+run;
+
+/* 4. Score OOT portfolio ––––––––––––––––––– */
+/* Score Stage 1 model */
+proc logistic inmodel=&outprefix.bout1 noprint;
+score data=&score_oot out=&outprefix.s1_oot fitstat;
+run;
+
+/* Score Stage 2 model */
+proc logistic inmodel=&outprefix.bout2 noprint;
+score data=&score_oot out=&outprefix.s2_oot fitstat;
+run;
+
+/* Sort both datasets */
 proc sort data=&outprefix.s1_oot; by &id_var; run;
 proc sort data=&outprefix.s2_oot; by &id_var; run;
 
+/* Create final scored dataset */
 data &outprefix.scored_oot;
-    merge &score_oot(in=src)
-          &outprefix.s1_oot
-          &outprefix.s2_oot;
-    by &id_var;
-    if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
-    if missing(algd_adj ) then algd_adj  = (&lgd_var > 0);
-    pred_lgd = p_loss * p_lgd;
+merge &outprefix.s1_oot(rename=(P_1=p_loss) keep=&id_var P_1)
+&outprefix.s2_oot(rename=(P_1=p_lgd) keep=&id_var P_1);
+by &id_var;
 run;
 
-/* 5. build per-stage full tables ------------------------------ */
-data &outprefix.s1_hist_full; merge &outprefix.scored_hist &outprefix.s1_hist; by &id_var; run;
-data &outprefix.s2_hist_full; merge &outprefix.scored_hist &outprefix.s2_hist; by &id_var; run;
-data &outprefix.s1_oot_full ; merge &outprefix.scored_oot  &outprefix.s1_oot ; by &id_var; run;
-data &outprefix.s2_oot_full ; merge &outprefix.scored_oot  &outprefix.s2_oot ; by &id_var; run;
+/* Sort and merge with original data */
+proc sort data=&score_oot; by &id_var; run;
+proc sort data=&outprefix.scored_oot; by &id_var; run;
 
-/* 6. performance metrics -------------------------------------- */
-%macro _pm(ds=, act=, pred=, ttl=);
-    title "&ttl";
-    %performance_metrics(data_=&ds, actual_var=&act, pred_var=&pred);
-    title;
+data &outprefix.scored_oot;
+merge &score_oot &outprefix.scored_oot;
+by &id_var;
+
+```
+/* Create binary flags if missing */
+if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+
+/* Final prediction */
+pred_lgd = p_loss * p_lgd;
+```
+
+run;
+
+/* 5. Build per-stage full tables —————————— */
+data &outprefix.s1_hist_full;
+set &outprefix.scored_hist;
+/* Keep only relevant variables for stage 1 analysis */
+run;
+
+data &outprefix.s2_hist_full;
+set &outprefix.scored_hist;
+/* Keep only relevant variables for stage 2 analysis */
+run;
+
+data &outprefix.s1_oot_full;
+set &outprefix.scored_oot;
+/* Keep only relevant variables for stage 1 analysis */
+run;
+
+data &outprefix.s2_oot_full;
+set &outprefix.scored_oot;
+/* Keep only relevant variables for stage 2 analysis */
+run;
+
+/* 6. Performance metrics ––––––––––––––––––– */
+%macro *pm(ds=, act=, pred=, ttl=);
+title “&ttl”;
+%performance_metrics(data*=&ds, actual_var=&act, pred_var=&pred);
+title;
 %mend;
 
-_pm(ds=&outprefix.s1_hist_full , act=lgd_stage1, pred=p_loss ,
-    ttl=Stage-1 HIST);
-_pm(ds=&outprefix.s2_hist_full , act=&lgd_var , pred=p_lgd  ,
-    ttl=Stage-2 HIST);
-_pm(ds=&outprefix.scored_hist , act=&lgd_var , pred=pred_lgd ,
-    ttl=Combined HIST);
+%_pm(ds=&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss,
+ttl=Stage-1 HIST);
+%_pm(ds=&outprefix.s2_hist_full, act=algd_adj, pred=p_lgd,
+ttl=Stage-2 HIST);
+%_pm(ds=&outprefix.scored_hist, act=&lgd_var, pred=pred_lgd,
+ttl=Combined HIST);
 
-_pm(ds=&outprefix.s1_oot_full , act=lgd_stage1, pred=p_loss ,
-    ttl=Stage-1 OOT);
-_pm(ds=&outprefix.s2_oot_full , act=&lgd_var , pred=p_lgd  ,
-    ttl=Stage-2 OOT);
-_pm(ds=&outprefix.scored_oot  , act=&lgd_var , pred=pred_lgd ,
-    ttl=Combined OOT);
+%_pm(ds=&outprefix.s1_oot_full, act=lgd_stage1, pred=p_loss,
+ttl=Stage-1 OOT);
+%_pm(ds=&outprefix.s2_oot_full, act=algd_adj, pred=p_lgd,
+ttl=Stage-2 OOT);
+%_pm(ds=&outprefix.scored_oot, act=&lgd_var, pred=pred_lgd,
+ttl=Combined OOT);
 
 %mend twostage_lgd;
