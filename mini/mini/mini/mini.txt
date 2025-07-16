@@ -1,1 +1,125 @@
-ABC
+/*---------------------------------------------------------------*/
+/* two-stage lgd modelling + scoring macro                       */
+/*---------------------------------------------------------------*/
+/* parms                                                          */
+/*   stage1_data   = dev sample for stage-1 (binary loss flag)    */
+/*   stage2_data   = dev sample for stage-2 (duplicated + wt)     */
+/*   score_hist    = full hist portfolio to score (same rows as   */
+/*                   stage1_data originally came from)            */
+/*   score_oot     = oot portfolio to score                       */
+/*   id_var        = unique loan id                               */
+/*   date_var      = bucket date for aggregation (e.g. def_date)  */
+/*   lgd_var       = realised 0-1 lgd  (hist + oot sets)          */
+/*   stage1_vars   = predictors for stage 1                       */
+/*   stage2_vars   = predictors for stage 2                       */
+/*   outprefix     = prefix for all work tables (default: tg_)    */
+/*---------------------------------------------------------------*/
+%macro twostage_lgd(
+      stage1_data =
+    , stage2_data =
+    , score_hist  =
+    , score_oot   =
+    , id_var      = loan_number
+    , date_var    = def_date
+    , lgd_var     = lgd_36m
+    , stage1_vars =
+    , stage2_vars =
+    , outprefix   = tg_
+);
+
+/*---------------------------------------------------------------*/
+/* 1. train stage-1  (prob any loss)                             */
+/*---------------------------------------------------------------*/
+proc logistic data=&stage1_data outmodel=&outprefix.bout1;
+    model lgd_stage1(event='1') = &stage1_vars / link=logit;
+run;
+
+/*---------------------------------------------------------------*/
+/* 2. train stage-2  (fractional logit on loss rows)             */
+/*---------------------------------------------------------------*/
+proc logistic data=&stage2_data outmodel=&outprefix.bout2;
+    model algd_adj(event='1') = &stage2_vars / link=logit;
+    weight wt;
+run;
+
+/*----------------------------------------------------------------
+   helper macro: score a portfolio with one outmodel, pull
+   the event-'1' probability into a simple var name
+-----------------------------------------------------------------*/
+%macro _score_one(inmodel=, data=, out=, predname=);
+    proc logistic inmodel=&inmodel noprint;
+        score data=&data out=&out(rename=(prob=&predname)) 
+              /* prob= puts the event-prob into var PROB  */
+              fitstat;
+    run;
+
+    /* keep only needed cols */
+    data &out;
+        set &out(keep=&id_var &predname);
+    run;
+%mend;
+
+/*---------------------------------------------------------------*/
+/* 3. score hist portfolio                                       */
+/*---------------------------------------------------------------*/
+%_score_one(inmodel=&outprefix.bout1, data=&score_hist , 
+            out=&outprefix.stg1_hist , predname=p_loss );
+%_score_one(inmodel=&outprefix.bout2, data=&score_hist , 
+            out=&outprefix.stg2_hist , predname=p_lgd  );
+
+/* merge -> final predicted lgd                                  */
+proc sort data=&outprefix.stg1_hist; by &id_var; run;
+proc sort data=&outprefix.stg2_hist; by &id_var; run;
+
+data &outprefix.scored_hist;
+    merge &score_hist(in=src keep=&id_var &date_var &lgd_var)
+          &outprefix.stg1_hist
+          &outprefix.stg2_hist;
+    by &id_var;
+    pred_lgd = p_loss * p_lgd;          /* two-stage product */
+run;
+
+/*---------------------------------------------------------------*/
+/* 4. score oot portfolio (same routine)                         */
+/*---------------------------------------------------------------*/
+%_score_one(inmodel=&outprefix.bout1, data=&score_oot , 
+            out=&outprefix.stg1_oot  , predname=p_loss );
+%_score_one(inmodel=&outprefix.bout2, data=&score_oot , 
+            out=&outprefix.stg2_oot  , predname=p_lgd  );
+
+proc sort data=&outprefix.stg1_oot; by &id_var; run;
+proc sort data=&outprefix.stg2_oot; by &id_var; run;
+
+data &outprefix.scored_oot;
+    merge &score_oot(in=src keep=&id_var &date_var &lgd_var)
+          &outprefix.stg1_oot
+          &outprefix.stg2_oot;
+    by &id_var;
+    pred_lgd = p_loss * p_lgd;
+run;
+
+/*---------------------------------------------------------------*/
+/* 5. aggregate mean lgd (actual vs pred) by date                */
+/*---------------------------------------------------------------*/
+%macro _agg(in=, out=, label=);
+    proc means data=&in noprint;
+        class &date_var;
+        var   &lgd_var  pred_lgd;
+        output out=&out(where=(_stat_="MEAN" and &date_var ne .));
+    run;
+
+    data &out;
+        set &out;
+        type="&label";
+    run;
+%mend;
+
+%_agg(in=&outprefix.scored_hist , out=&outprefix.comp_hist , label=HIST);
+%_agg(in=&outprefix.scored_oot  , out=&outprefix.comp_oot  , label=OOT);
+
+/* final comparison table you can feed to plots / PSI calc */
+data &outprefix.compare_all;
+    set &outprefix.comp_hist &outprefix.comp_oot;
+run;
+
+%mend twostage_lgd;
