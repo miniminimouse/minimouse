@@ -42,7 +42,7 @@ proc sort data=&outprefix.s2_hist; by &id_var; run;
 
 /* Create final scored dataset */
 data &outprefix.scored_hist;
-merge &outprefix.s1_hist(rename=(P_1=p_loss) keep=&id_var P_1)
+merge &outprefix.s1_hist(rename=(P_2=p_loss) keep=&id_var P_2)
 &outprefix.s2_hist(rename=(P_1=p_lgd) keep=&id_var P_1);
 by &id_var;
 run;
@@ -60,7 +60,7 @@ by &id_var;
 if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
 if missing(algd_adj) then algd_adj = (&lgd_var > 0);
 
-/* Final prediction */
+/* Final prediction - now we know p_loss and p_lgd are for same loan */
 pred_lgd = p_loss * p_lgd;
 ```
 
@@ -83,7 +83,7 @@ proc sort data=&outprefix.s2_oot; by &id_var; run;
 
 /* Create final scored dataset */
 data &outprefix.scored_oot;
-merge &outprefix.s1_oot(rename=(P_1=p_loss) keep=&id_var P_1)
+merge &outprefix.s1_oot(rename=(P_2=p_loss) keep=&id_var P_2)
 &outprefix.s2_oot(rename=(P_1=p_lgd) keep=&id_var P_1);
 by &id_var;
 run;
@@ -101,7 +101,7 @@ by &id_var;
 if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
 if missing(algd_adj) then algd_adj = (&lgd_var > 0);
 
-/* Final prediction */
+/* Final prediction - now we know p_loss and p_lgd are for same loan */
 pred_lgd = p_loss * p_lgd;
 ```
 
