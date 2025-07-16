@@ -123,3 +123,14 @@ data &outprefix.compare_all;
 run;
 
 %mend twostage_lgd;
+
+/* assumes you already have these macro variables populated */
+%twostage_lgd(
+      stage1_data = lgd_stage1_wf_wadj
+    , stage2_data = lgd_stage2_wf_wadj
+    , score_hist  = lgd_stage_all_wf
+    , score_oot   = lgd_stage_all_oot
+    , stage1_vars = &stage1_vars    /* e.g. rating_bin hpi_chg */
+    , stage2_vars = &stage2_vars
+    , outprefix   = run1_
+);
