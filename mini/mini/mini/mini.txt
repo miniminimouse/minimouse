@@ -129,10 +129,25 @@ set &outprefix.scored_oot;
 run;
 
 /* 6. Performance metrics ––––––––––––––––––– */
-%macro *pm(ds=, act=, pred=, ttl=);
-title “&ttl”;
-%performance_metrics(data*=&ds, actual_var=&act, pred_var=&pred);
+%macro _pm(ds=, act=, pred=, ttl=);
+/* Create aggregated data for performance metrics */
+proc means data=&ds noprint;
+class &date_var;
+var &act &pred;
+output out=&ds._compare(where=(*stat*=“MEAN” and &date_var^=.));
+run;
+
+```
+data &ds._compare;
+    set &ds._compare;
+    Type="HIST";
+run;
+
+title "&ttl";
+%performance_metrics(data_=&ds._compare, actual_var=&act, pred_var=&pred);
 title;
+```
+
 %mend;
 
 %_pm(ds=&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss,
