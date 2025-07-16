@@ -1,5 +1,5 @@
 /*================================================================*/
-/*  twostage_lgd – two-stage LGD stack (FIXED)                   */
+/*  twostage_lgd - two-stage LGD stack (FIXED)                   */
 /*================================================================*/
 %macro twostage_lgd(
 stage1_data =
@@ -14,12 +14,12 @@ stage1_data =
 , outprefix   = tg_
 );
 
-/* 1. Stage-1 model – probability of loss ––––––––––– */
+/* 1. Stage-1 model - probability of loss ––––––––––– */
 proc logistic data=&stage1_data outmodel=&outprefix.bout1;
 model lgd_stage1(event=‘1’) = &stage1_vars / link=logit;
 run;
 
-/* 2. Stage-2 model – E(LGD | loss) –––––––––––––– */
+/* 2. Stage-2 model - E(LGD | loss) –––––––––––––– */
 proc logistic data=&stage2_data outmodel=&outprefix.bout2;
 model algd_adj(event=‘1’) = &stage2_vars / link=logit;
 weight wt;
