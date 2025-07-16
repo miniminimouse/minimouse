@@ -1,38 +1,102 @@
-%macro _run_pm(ds=, act=, pred=, caption=);
-   title "&caption";            /* override */
-   %performance_metrics(data_=&ds,
-                        actual_var=&act,
-                        pred_var=&pred);
-   title;                       /* reset    */
+/*================================================================*/
+/*  twostage_lgd – two-stage LGD stack (no KEEP)                  */
+/*================================================================*/
+%macro twostage_lgd(
+      stage1_data =
+    , stage2_data =
+    , score_hist  =
+    , score_oot   =
+    , id_var      = loan_number
+    , date_var    = def_date
+    , lgd_var     = lgd_36m
+    , stage1_vars =
+    , stage2_vars =
+    , outprefix   = tg_
+);
+
+/* 1. Stage-1 model – probability of loss ---------------------- */
+proc logistic data=&stage1_data outmodel=&outprefix.bout1;
+    model lgd_stage1(event='1') = &stage1_vars / link=logit;
+run;
+
+/* 2. Stage-2 model – E(LGD | loss) ---------------------------- */
+proc logistic data=&stage2_data outmodel=&outprefix.bout2;
+    model algd_adj(event='1')   = &stage2_vars / link=logit;
+    weight wt;
+run;
+
+/* helper: score one model, rename P_1 ------------------------- */
+%macro _score_one(inmodel=, data=, out=, prob=);
+    proc logistic inmodel=&inmodel;
+        score data=&data out=&out(rename=(P_1=&prob)) fitstat;
+    run;
+    data &out; set &out(keep=&id_var &prob); run;
 %mend;
 
-/* ───────── six calls ───────── */
-%_run_pm(ds=&outprefix.s1_hist_full ,
-         act=lgd_stage1 ,
-         pred=p_loss ,
-         caption=Stage-1  HIST);
+/* 3. score HIST portfolio ------------------------------------- */
+%_score_one(inmodel=&outprefix.bout1, data=&score_hist,
+            out=&outprefix.s1_hist, prob=p_loss);
+%_score_one(inmodel=&outprefix.bout2, data=&score_hist,
+            out=&outprefix.s2_hist, prob=p_lgd );
 
-%_run_pm(ds=&outprefix.s2_hist_full ,
-         act=&lgd_var ,
-         pred=p_lgd ,
-         caption=Stage-2  HIST);
+proc sort data=&outprefix.s1_hist; by &id_var; run;
+proc sort data=&outprefix.s2_hist; by &id_var; run;
 
-%_run_pm(ds=&outprefix.scored_hist ,
-         act=&lgd_var ,
-         pred=pred_lgd ,
-         caption=Combined HIST);
+data &outprefix.scored_hist;
+    merge &score_hist(in=src)   /* keep EVERYTHING               */
+          &outprefix.s1_hist
+          &outprefix.s2_hist;
+    by &id_var;
+    /* supply flags if missing */
+    if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+    if missing(algd_adj ) then algd_adj  = (&lgd_var > 0);
+    pred_lgd = p_loss * p_lgd;
+run;
 
-%_run_pm(ds=&outprefix.s1_oot_full ,
-         act=lgd_stage1 ,
-         pred=p_loss ,
-         caption=Stage-1  OOT);
+/* 4. score OOT portfolio -------------------------------------- */
+%_score_one(inmodel=&outprefix.bout1, data=&score_oot,
+            out=&outprefix.s1_oot, prob=p_loss);
+%_score_one(inmodel=&outprefix.bout2, data=&score_oot,
+            out=&outprefix.s2_oot, prob=p_lgd );
 
-%_run_pm(ds=&outprefix.s2_oot_full ,
-         act=&lgd_var ,
-         pred=p_lgd ,
-         caption=Stage-2  OOT);
+proc sort data=&outprefix.s1_oot; by &id_var; run;
+proc sort data=&outprefix.s2_oot; by &id_var; run;
 
-%_run_pm(ds=&outprefix.scored_oot ,
-         act=&lgd_var ,
-         pred=pred_lgd ,
-         caption=Combined OOT);
+data &outprefix.scored_oot;
+    merge &score_oot(in=src)
+          &outprefix.s1_oot
+          &outprefix.s2_oot;
+    by &id_var;
+    if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+    if missing(algd_adj ) then algd_adj  = (&lgd_var > 0);
+    pred_lgd = p_loss * p_lgd;
+run;
+
+/* 5. build per-stage full tables ------------------------------ */
+data &outprefix.s1_hist_full; merge &outprefix.scored_hist &outprefix.s1_hist; by &id_var; run;
+data &outprefix.s2_hist_full; merge &outprefix.scored_hist &outprefix.s2_hist; by &id_var; run;
+data &outprefix.s1_oot_full ; merge &outprefix.scored_oot  &outprefix.s1_oot ; by &id_var; run;
+data &outprefix.s2_oot_full ; merge &outprefix.scored_oot  &outprefix.s2_oot ; by &id_var; run;
+
+/* 6. performance metrics -------------------------------------- */
+%macro _pm(ds=, act=, pred=, ttl=);
+    title "&ttl";
+    %performance_metrics(data_=&ds, actual_var=&act, pred_var=&pred);
+    title;
+%mend;
+
+_pm(ds=&outprefix.s1_hist_full , act=lgd_stage1, pred=p_loss ,
+    ttl=Stage-1 HIST);
+_pm(ds=&outprefix.s2_hist_full , act=&lgd_var , pred=p_lgd  ,
+    ttl=Stage-2 HIST);
+_pm(ds=&outprefix.scored_hist , act=&lgd_var , pred=pred_lgd ,
+    ttl=Combined HIST);
+
+_pm(ds=&outprefix.s1_oot_full , act=lgd_stage1, pred=p_loss ,
+    ttl=Stage-1 OOT);
+_pm(ds=&outprefix.s2_oot_full , act=&lgd_var , pred=p_lgd  ,
+    ttl=Stage-2 OOT);
+_pm(ds=&outprefix.scored_oot  , act=&lgd_var , pred=pred_lgd ,
+    ttl=Combined OOT);
+
+%mend twostage_lgd;
