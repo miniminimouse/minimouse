@@ -1,167 +1,108 @@
-/*================================================================*/
-/*  twostage_lgd - two-stage LGD stack (FIXED)                   */
-/*================================================================*/
-%macro twostage_lgd(
-stage1_data =
-, stage2_data =
-, score_hist  =
-, score_oot   =
-, id_var      = loan_number
-, date_var    = def_date
-, lgd_var     = lgd_36m
-, stage1_vars =
-, stage2_vars =
-, outprefix   = tg_
-);
+%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio Lag12_Unemp_SA
+PchgO_MA3_Home_Sales BAL_DEF_ADJ PchgO_Unemp_15_Pls_W
+Lag6_PChg12_HPI_P_On pre2007dummy;
 
-/* 1. Stage-1 model - probability of loss ––––––––––– */
-proc logistic data=&stage1_data outmodel=&outprefix.bout1;
-model lgd_stage1(event=‘1’) = &stage1_vars / link=logit;
+data train_data;
+    set lgd_stage_all_wf;
+    model_lgd = lgd_36m;
 run;
 
-/* 2. Stage-2 model - E(LGD | loss) –––––––––––––– */
-proc logistic data=&stage2_data outmodel=&outprefix.bout2;
-model algd_adj(event=‘1’) = &stage2_vars / link=logit;
-weight wt;
+data score_oot;
+    set oot_final_data;
+    model_lgd = .;
 run;
 
-/* 3. Score HIST portfolio ———————————–– */
-/* Score Stage 1 model */
-proc logistic inmodel=&outprefix.bout1 noprint;
-score data=&score_hist out=&outprefix.s1_hist fitstat;
+data combined;
+    set train_data (in=intrain) score_oot (in=inoot);
+    if intrain then flag = 'TRAIN';
+    else flag = 'OOT';
 run;
 
-/* Score Stage 2 model */
-proc logistic inmodel=&outprefix.bout2 noprint;
-score data=&score_hist out=&outprefix.s2_hist fitstat;
+proc qlim data=combined;
+    model model_lgd = &all_vars;
+    endogenous model_lgd ~ censored(lb=0 ub=1);
+    output out=tobit_results predicted marginal;
 run;
 
-/* Sort both datasets */
-proc sort data=&outprefix.s1_hist; by &id_var; run;
-proc sort data=&outprefix.s2_hist; by &id_var; run;
-
-/* Create final scored dataset */
-data &outprefix.scored_hist;
-merge &outprefix.s1_hist(rename=(P_2=p_loss) keep=&id_var P_2)
-&outprefix.s2_hist(rename=(P_1=p_lgd) keep=&id_var P_1);
-by &id_var;
+proc lifereg data=combined;
+    model model_lgd = &all_vars / distribution=normal;
+    output out=lifereg_results predicted=pred_lgd;
 run;
 
-/* Sort and merge with original data */
-proc sort data=&score_hist; by &id_var; run;
-proc sort data=&outprefix.scored_hist; by &id_var; run;
-
-data &outprefix.scored_hist;
-merge &score_hist &outprefix.scored_hist;
-by &id_var;
-
-```
-/* Create binary flags if missing */
-if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
-if missing(algd_adj) then algd_adj = (&lgd_var > 0);
-
-/* Final prediction - now we know p_loss and p_lgd are for same loan */
-pred_lgd = p_loss * p_lgd;
-```
-
+proc means data=tobit_results (where=(flag='TRAIN'));
+    var lgd_36m P_model_lgd M_model_lgd;
 run;
 
-/* 4. Score OOT portfolio ––––––––––––––––––– */
-/* Score Stage 1 model */
-proc logistic inmodel=&outprefix.bout1 noprint;
-score data=&score_oot out=&outprefix.s1_oot fitstat;
+proc sgplot data=tobit_results (where=(flag='TRAIN'));
+    scatter x=lgd_36m y=P_model_lgd;
+    refline 0 / axis=x;
+    refline 0 / axis=y;
+    lineparm x=0 y=0 slope=1 / lineattrs=(color=gray pattern=dash);
 run;
 
-/* Score Stage 2 model */
-proc logistic inmodel=&outprefix.bout2 noprint;
-score data=&score_oot out=&outprefix.s2_oot fitstat;
+data residuals_train;
+    set tobit_results (where=(flag='TRAIN'));
+    residual = lgd_36m - P_model_lgd;
+    abs_residual = abs(residual);
 run;
 
-/* Sort both datasets */
-proc sort data=&outprefix.s1_oot; by &id_var; run;
-proc sort data=&outprefix.s2_oot; by &id_var; run;
-
-/* Create final scored dataset */
-data &outprefix.scored_oot;
-merge &outprefix.s1_oot(rename=(P_2=p_loss) keep=&id_var P_2)
-&outprefix.s2_oot(rename=(P_1=p_lgd) keep=&id_var P_1);
-by &id_var;
+proc sgplot data=residuals_train;
+    scatter x=P_model_lgd y=residual;
+    refline 0 / axis=y;
 run;
 
-/* Sort and merge with original data */
-proc sort data=&score_oot; by &id_var; run;
-proc sort data=&outprefix.scored_oot; by &id_var; run;
+proc sql;
+    create table metrics_train as
+    select
+        mean(residual) as mean_residual,
+        std(residual) as std_residual,
+        mean(abs_residual) as mae,
+        sqrt(mean(residual**2)) as rmse
+    from residuals_train;
+quit;
 
-data &outprefix.scored_oot;
-merge &score_oot &outprefix.scored_oot;
-by &id_var;
-
-```
-/* Create binary flags if missing */
-if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
-if missing(algd_adj) then algd_adj = (&lgd_var > 0);
-
-/* Final prediction - now we know p_loss and p_lgd are for same loan */
-pred_lgd = p_loss * p_lgd;
-```
-
+proc print data=metrics_train;
 run;
 
-/* 5. Build per-stage full tables —————————— */
-data &outprefix.s1_hist_full;
-set &outprefix.scored_hist;
-/* Keep only relevant variables for stage 1 analysis */
+proc means data=tobit_results (where=(flag='OOT'));
+    var lgd_36m P_model_lgd M_model_lgd;
 run;
 
-data &outprefix.s2_hist_full;
-set &outprefix.scored_hist;
-/* Keep only relevant variables for stage 2 analysis */
+proc sgplot data=tobit_results (where=(flag='OOT'));
+    scatter x=lgd_36m y=P_model_lgd;
+    refline 0 / axis=x;
+    refline 0 / axis=y;
+    lineparm x=0 y=0 slope=1 / lineattrs=(color=gray pattern=dash);
 run;
 
-data &outprefix.s1_oot_full;
-set &outprefix.scored_oot;
-/* Keep only relevant variables for stage 1 analysis */
+data residuals_oot;
+    set tobit_results (where=(flag='OOT'));
+    residual = lgd_36m - P_model_lgd;
+    abs_residual = abs(residual);
 run;
 
-data &outprefix.s2_oot_full;
-set &outprefix.scored_oot;
-/* Keep only relevant variables for stage 2 analysis */
+proc sgplot data=residuals_oot;
+    scatter x=P_model_lgd y=residual;
+    refline 0 / axis=y;
 run;
 
-/* 6. Performance metrics ––––––––––––––––––– */
-%macro _pm(ds=, act=, pred=, ttl=);
-/* Create aggregated data for performance metrics */
-proc means data=&ds noprint;
-class &date_var;
-var &act &pred;
-output out=&ds._compare(where=(*stat*=“MEAN” and &date_var^=.));
+proc sql;
+    create table metrics_oot as
+    select
+        mean(residual) as mean_residual,
+        std(residual) as std_residual,
+        mean(abs_residual) as mae,
+        sqrt(mean(residual**2)) as rmse
+    from residuals_oot;
+quit;
+
+proc print data=metrics_oot;
 run;
 
-```
-data &ds._compare;
-    set &ds._compare;
-    Type="HIST";
+proc reg data=train_data;
+    model lgd_36m = &all_vars / selection=stepwise slentry=0.05 slstay=0.05;
 run;
 
-title "&ttl";
-%performance_metrics(data_=&ds._compare, actual_var=&act, pred_var=&pred);
-title;
-```
-
-%mend;
-
-%_pm(ds=&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss,
-ttl=Stage-1 HIST);
-%_pm(ds=&outprefix.s2_hist_full, act=algd_adj, pred=p_lgd,
-ttl=Stage-2 HIST);
-%_pm(ds=&outprefix.scored_hist, act=&lgd_var, pred=pred_lgd,
-ttl=Combined HIST);
-
-%_pm(ds=&outprefix.s1_oot_full, act=lgd_stage1, pred=p_loss,
-ttl=Stage-1 OOT);
-%_pm(ds=&outprefix.s2_oot_full, act=algd_adj, pred=p_lgd,
-ttl=Stage-2 OOT);
-%_pm(ds=&outprefix.scored_oot, act=&lgd_var, pred=pred_lgd,
-ttl=Combined OOT);
-
-%mend twostage_lgd;
+proc corr data=train_data;
+    var &all_vars;
+run;
