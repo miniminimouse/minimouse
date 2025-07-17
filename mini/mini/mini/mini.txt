@@ -1,253 +1,39 @@
-/*================================================================*/
-/*  kfold_twostage_lgd - K-fold cross-validation using existing   */
-/*  twostage_lgd macro                                            */
-/*================================================================*/
-%macro kfold_twostage_lgd(
-data =
-, k = 10
-, id_var = loan_number
-, date_var = def_date
-, lgd_var = lgd_36m
-, stage1_vars =
-, stage2_vars =
-, outprefix = kfold_
-, seed = 12345
-);
-
-/* 1. Create k-fold splits */
-proc sort data=&data; by &id_var; run;
-
-data &outprefix.folds;
-set &data;
-call streaminit(&seed);
-fold = ceil(rand('uniform') * &k);
-run;
-
-/* Initialize results dataset */
-data &outprefix.cv_results;
-length fold 8 dataset $10 stage $20 metric $10 value 8;
-delete;
-run;
-
-/* 2. Loop through each fold */
-%do fold_i = 1 %to &k;
-    %put NOTE: Processing fold &fold_i of &k;
-    
-    /* Create train and test sets */
-    data &outprefix.train_&fold_i;
-    set &outprefix.folds;
-    where fold ne &fold_i;
-    run;
-    
-    data &outprefix.test_&fold_i;
-    set &outprefix.folds;
-    where fold = &fold_i;
-    run;
-    
-    /* Create stage-specific training datasets */
-    data &outprefix.stage1_train_&fold_i;
-    set &outprefix.train_&fold_i;
-    lgd_stage1 = (&lgd_var > 0);
-    run;
-    
-    data &outprefix.stage2_train_&fold_i;
-    set &outprefix.train_&fold_i;
-    where &lgd_var > 0;
-    algd_adj = (&lgd_var > 0);
-    wt = 1; /* Add weight variable */
-    run;
-    
-    /* Run two-stage LGD macro for this fold */
-    %twostage_lgd(
-        stage1_data = &outprefix.stage1_train_&fold_i
-        , stage2_data = &outprefix.stage2_train_&fold_i
-        , score_hist = &outprefix.train_&fold_i
-        , score_oot = &outprefix.test_&fold_i
-        , id_var = &id_var
-        , date_var = &date_var
-        , lgd_var = &lgd_var
-        , stage1_vars = &stage1_vars
-        , stage2_vars = &stage2_vars
-        , outprefix = &outprefix.f&fold_i._
-    );
-    
-    /* Extract metrics for this fold */
-    %extract_fold_metrics(fold=&fold_i, prefix=&outprefix.f&fold_i._);
-    
-%end;
-
-/* 3. Aggregate results across all folds */
-proc sort data=&outprefix.cv_results; by dataset stage metric; run;
-
-proc means data=&outprefix.cv_results noprint;
-by dataset stage metric;
-var value;
-output out=&outprefix.cv_summary 
-    mean=mean_value std=std_value min=min_value max=max_value n=n_folds;
-run;
-
-/* 4. Create formatted output similar to your table */
-data &outprefix.formatted_results;
-set &outprefix.cv_summary;
-length result_type $50;
-result_type = catx(' - ', dataset, stage, metric);
-run;
-
-/* Display results */
-title "K-Fold Cross-Validation Results (K=&k)";
-title2 "Mean Performance Across All Folds";
-proc print data=&outprefix.formatted_results noobs;
-var result_type mean_value std_value min_value max_value n_folds;
-format mean_value std_value min_value max_value 8.6;
-run;
-
-/* Create fold-by-fold table like your example */
-proc transpose data=&outprefix.cv_results out=&outprefix.pivot_results prefix=fold_;
-by dataset stage metric;
-id fold;
-var value;
-run;
-
-title2 "Fold-by-Fold Results";
-proc print data=&outprefix.pivot_results noobs;
-var dataset stage metric fold_1-fold_&k;
-format fold_1-fold_&k 8.6;
-run;
-
-/* Clean up temporary datasets */
-%do fold_i = 1 %to &k;
-    proc datasets lib=work nolist;
-        delete &outprefix.train_&fold_i &outprefix.test_&fold_i 
-               &outprefix.stage1_train_&fold_i &outprefix.stage2_train_&fold_i
-               &outprefix.f&fold_i._:;
-    quit;
-%end;
-
-%mend kfold_twostage_lgd;
-
-/*================================================================*/
-/*  Helper macro to extract metrics from _compare datasets       */
-/*================================================================*/
-%macro extract_fold_metrics(fold=, prefix=);
-
-/* Extract metrics from the _compare datasets created by twostage_lgd */
-%macro extract_from_compare(ds=, stage_name=, dataset_type=);
-    %if %sysfunc(exist(&ds)) %then %do;
-        /* Calculate metrics from the _compare dataset */
-        proc means data=&ds noprint;
-        var residual abs_residual squared_residual;
-        output out=_temp_stats 
-            mean(abs_residual)=MAE 
-            mean(squared_residual)=MSE;
-        run;
-        
-        data _temp_metrics;
-        set _temp_stats;
-        fold = &fold;
-        dataset = "&dataset_type";
-        stage = "&stage_name";
-        
-        /* Calculate RMSE */
-        RMSE = sqrt(MSE);
-        
-        /* Output metrics */
-        metric = "MAE"; value = MAE; output;
-        metric = "MSE"; value = MSE; output;
-        metric = "RMSE"; value = RMSE; output;
-        
-        keep fold dataset stage metric value;
-        run;
-        
-        proc append base=&outprefix.cv_results data=_temp_metrics force;
-        run;
-        
-        proc datasets lib=work nolist;
-            delete _temp_metrics _temp_stats;
-        quit;
-    %end;
+%macro twostage_lgd( stage1_data = lgd_stage1_wf_wadj, stage2_data = lgd_stage2_wf_wadj, score_hist = lgd_stage_all_wf, score_oot = &OOT_data, id_var = loan_number, date_var = def_date, lgd_var = lgd_36m, stage1_vars = &stage1_vars, stage2_vars = &stage2_vars, outprefix = tg_ );
+/* 1. Stage-1 model - Probability of loss */ proc logistic data=&stage1_data outmodel=work.&outprefix.bout1; model lgd_stage1(ref=‘1’) = &stage1_vars / link=logit; run;
+/* 2. Stage-2 model - E(LGD | loss) */ proc logistic data=&stage2_data outmodel=work.&outprefix.bout2; model algd_adj(event=‘1’) = &stage2_vars / link=logit; weight wt; run;
+/* 3. Score HIST portfolio */
+/* Score Stage 1 model */ proc logistic inmodel=work.&outprefix.bout1 noprint; score data=&score_hist out=work.&outprefix.s1_hist fitstat; run;
+/* Score Stage 2 model */ proc logistic inmodel=work.&outprefix.bout2 noprint; score data=&score_hist out=work.&outprefix.s2_hist fitstat; run;
+/* Sort both datasets */ proc sort data=work.&outprefix.s1_hist; by &id_var; run; proc sort data=work.&outprefix.s2_hist; by &id_var; run;
+/* Create final scored dataset */ data work.&outprefix.scored_hist; merge work.&outprefix.s1_hist (rename=(P_2=p_loss) keep=&id_var P_2) work.&outprefix.s2_hist (rename=(P_1=p_lgd) keep=&id_var P_1); by &id_var; run;
+/* Sort and merge with original data */ proc sort data=&score_hist; by &id_var; run; proc sort data=work.&outprefix.scored_hist; by &id_var; run;
+data work.&outprefix.scored_hist; merge &score_hist work.&outprefix.scored_hist; by &id_var; run;
+/* Create binary flags if missing */ if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+/* Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
+/* 4. Score OOT portfolio */
+/* Score Stage 1 model */ proc logistic inmodel=work.&outprefix.bout1 noprint; score data=&score_oot out=work.&outprefix.s1_oot fitstat; run;
+/* Score Stage 2 model */ proc logistic inmodel=work.&outprefix.bout2 noprint; score data=&score_oot out=work.&outprefix.s2_oot fitstat; run;
+/* Sort both datasets */ proc sort data=work.&outprefix.s1_oot; by &id_var; run; proc sort data=work.&outprefix.s2_oot; by &id_var; run;
+/* Create final scored dataset */ data work.&outprefix.scored_oot; merge work.&outprefix.s1_oot (rename=(P_2=p_loss) keep=&id_var P_2) work.&outprefix.s2_oot (rename=(P_1=p_lgd) keep=&id_var P_1); by &id_var; run;
+/* Sort and merge with original data */ proc sort data=&score_oot; by &id_var; run; proc sort data=work.&outprefix.scored_oot; by &id_var; run;
+data work.&outprefix.scored_oot; merge &score_oot work.&outprefix.scored_oot; by &id_var; run;
+/* Create binary flags if missing */ if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+/* Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
+/* 5. Build per-stage full tables */
+data work.&outprefix.s1_hist_full; set work.&outprefix.scored_hist; /* Keep only relevant variables for stage 1 analysis */ run;
+data work.&outprefix.s2_hist_full; set work.&outprefix.scored_hist; /* Keep only relevant variables for stage 2 analysis */ run;
+data work.&outprefix.s1_oot_full; set work.&outprefix.scored_oot; /* Keep only relevant variables for stage 1 analysis */ run;
+data work.&outprefix.s2_oot_full; set work.&outprefix.scored_oot; /* Keep only relevant variables for stage 2 analysis */ run;
+/* 6. Performance metrics */
+%macro pm(ds=, act=, pred=, ttl=, filter=);
+/* Create aggregated data for performance metrics */ proc means data=&ds noprint; where &filter; class &date_var; var &act &pred; output out=work.&ds._compare (where=(stat=“MEAN” and &date_var^=.)) mean=; run;
+data work.&ds._compare; set work.&ds._compare; Type=”&ttl”; run;
+title “&ttl”;
 %mend;
-
-/* Extract metrics for each stage and dataset type */
-%extract_from_compare(ds=&prefix.s1_hist_full_compare, stage_name=Stage1, dataset_type=Train);
-%extract_from_compare(ds=&prefix.s1_oot_full_compare, stage_name=Stage1, dataset_type=Test);
-%extract_from_compare(ds=&prefix.s2_hist_full_compare, stage_name=Stage2, dataset_type=Train);
-%extract_from_compare(ds=&prefix.s2_oot_full_compare, stage_name=Stage2, dataset_type=Test);
-%extract_from_compare(ds=&prefix.scored_hist_compare, stage_name=Combined, dataset_type=Train);
-%extract_from_compare(ds=&prefix.scored_oot_compare, stage_name=Combined, dataset_type=Test);
-
-%mend extract_fold_metrics;
-
-/*================================================================*/
-/*  Alternative: Direct metric calculation if _compare structure  */
-/*  is different                                                  */
-/*================================================================*/
-%macro extract_fold_metrics_direct(fold=, prefix=);
-
-%macro calc_direct_metrics(ds=, actual_var=, pred_var=, stage_name=, dataset_type=);
-    %if %sysfunc(exist(&ds)) %then %do;
-        data _temp_calc;
-        set &ds;
-        where not missing(&actual_var) and not missing(&pred_var);
-        
-        residual = &actual_var - &pred_var;
-        abs_residual = abs(residual);
-        squared_residual = residual**2;
-        run;
-        
-        proc means data=_temp_calc noprint;
-        var abs_residual squared_residual;
-        output out=_temp_stats 
-            mean(abs_residual)=MAE 
-            mean(squared_residual)=MSE;
-        run;
-        
-        data _temp_metrics;
-        set _temp_stats;
-        fold = &fold;
-        dataset = "&dataset_type";
-        stage = "&stage_name";
-        
-        RMSE = sqrt(MSE);
-        
-        metric = "MAE"; value = MAE; output;
-        metric = "MSE"; value = MSE; output;
-        metric = "RMSE"; value = RMSE; output;
-        
-        keep fold dataset stage metric value;
-        run;
-        
-        proc append base=&outprefix.cv_results data=_temp_metrics force;
-        run;
-        
-        proc datasets lib=work nolist;
-            delete _temp_calc _temp_metrics _temp_stats;
-        quit;
-    %end;
-%mend;
-
-/* Calculate metrics directly from scored datasets */
-%calc_direct_metrics(ds=&prefix.s1_hist_full, actual_var=lgd_stage1, pred_var=p_loss, stage_name=Stage1, dataset_type=Train);
-%calc_direct_metrics(ds=&prefix.s1_oot_full, actual_var=lgd_stage1, pred_var=p_loss, stage_name=Stage1, dataset_type=Test);
-%calc_direct_metrics(ds=&prefix.s2_hist_full, actual_var=algd_adj, pred_var=p_lgd, stage_name=Stage2, dataset_type=Train);
-%calc_direct_metrics(ds=&prefix.s2_oot_full, actual_var=algd_adj, pred_var=p_lgd, stage_name=Stage2, dataset_type=Test);
-%calc_direct_metrics(ds=&prefix.scored_hist, actual_var=&lgd_var, pred_var=pred_lgd, stage_name=Combined, dataset_type=Train);
-%calc_direct_metrics(ds=&prefix.scored_oot, actual_var=&lgd_var, pred_var=pred_lgd, stage_name=Combined, dataset_type=Test);
-
-%mend extract_fold_metrics_direct;
-
-/*================================================================*/
-/*  Usage Example                                                */
-/*================================================================*/
-/*
-%kfold_twostage_lgd(
-    data = my_dataset
-    , k = 10
-    , id_var = loan_number
-    , date_var = def_date
-    , lgd_var = lgd_36m
-    , stage1_vars = var1 var2 var3
-    , stage2_vars = var4 var5 var6
-    , outprefix = cv_
-    , seed = 12345
-);
-*/
+/* Stage 1 metrics - all observations */ %pm(ds=work.&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss, ttl=Stage-1 HIST);
+/* Stage 1 metrics - all observations */ %pm(ds=work.&outprefix.s1_oot_full, act=lgd_stage1, pred=p_loss, ttl=Stage-1 OOT);
+/* Stage 2 metrics - ONLY observations where actual LGD > 0 */ %pm(ds=work.&outprefix.s2_hist_full, act=algd_adj, pred=p_lgd, ttl=Stage-2 HIST, filter=&lgd_var > 0);
+/* Stage 2 metrics - ONLY observations where actual LGD > 0 */ %pm(ds=work.&outprefix.s2_oot_full, act=algd_adj, pred=p_lgd, ttl=Stage-2 OOT, filter=&lgd_var > 0);
+/* Combined metrics - all observations */ %pm(ds=work.&outprefix.scored_hist, act=&lgd_var, pred=pred_lgd, ttl=Combined HIST);
+/* Combined metrics - all observations */ %pm(ds=work.&outprefix.scored_oot, act=&lgd_var, pred=pred_lgd, ttl=Combined OOT);
+%mend twostage_lgd;
