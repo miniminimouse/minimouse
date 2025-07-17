@@ -7,18 +7,14 @@
 /* Sort both datasets */ proc sort data=work.&outprefix.s1_hist; by &id_var; run; proc sort data=work.&outprefix.s2_hist; by &id_var; run;
 /* Create final scored dataset */ data work.&outprefix.scored_hist; merge work.&outprefix.s1_hist (rename=(P_2=p_loss) keep=&id_var P_2) work.&outprefix.s2_hist (rename=(P_1=p_lgd) keep=&id_var P_1); by &id_var; run;
 /* Sort and merge with original data */ proc sort data=&score_hist; by &id_var; run; proc sort data=work.&outprefix.scored_hist; by &id_var; run;
-data work.&outprefix.scored_hist; merge &score_hist work.&outprefix.scored_hist; by &id_var; run;
-/* Create binary flags if missing */ if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0);
-/* Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
+data work.&outprefix.scored_hist; merge &score_hist work.&outprefix.scored_hist; by &id_var; /* Create binary flags if missing / if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0); / Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
 /* 4. Score OOT portfolio */
 /* Score Stage 1 model */ proc logistic inmodel=work.&outprefix.bout1 noprint; score data=&score_oot out=work.&outprefix.s1_oot fitstat; run;
 /* Score Stage 2 model */ proc logistic inmodel=work.&outprefix.bout2 noprint; score data=&score_oot out=work.&outprefix.s2_oot fitstat; run;
 /* Sort both datasets */ proc sort data=work.&outprefix.s1_oot; by &id_var; run; proc sort data=work.&outprefix.s2_oot; by &id_var; run;
 /* Create final scored dataset */ data work.&outprefix.scored_oot; merge work.&outprefix.s1_oot (rename=(P_2=p_loss) keep=&id_var P_2) work.&outprefix.s2_oot (rename=(P_1=p_lgd) keep=&id_var P_1); by &id_var; run;
 /* Sort and merge with original data */ proc sort data=&score_oot; by &id_var; run; proc sort data=work.&outprefix.scored_oot; by &id_var; run;
-data work.&outprefix.scored_oot; merge &score_oot work.&outprefix.scored_oot; by &id_var; run;
-/* Create binary flags if missing */ if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0);
-/* Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
+data work.&outprefix.scored_oot; merge &score_oot work.&outprefix.scored_oot; by &id_var; /* Create binary flags if missing / if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0); if missing(algd_adj) then algd_adj = (&lgd_var > 0); / Final prediction - now we know p_loss and p_lgd are for same */ pred_lgd = p_loss * p_lgd; run;
 /* 5. Build per-stage full tables */
 data work.&outprefix.s1_hist_full; set work.&outprefix.scored_hist; /* Keep only relevant variables for stage 1 analysis */ run;
 data work.&outprefix.s2_hist_full; set work.&outprefix.scored_hist; /* Keep only relevant variables for stage 2 analysis */ run;
