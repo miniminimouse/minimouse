@@ -1,229 +1,167 @@
+/*================================================================*/
+/*  twostage_lgd - two-stage LGD stack (FIXED)                   */
+/*================================================================*/
 %macro twostage_lgd(
-    stage1_data = lgd_stage1_wf_wadj,
-    stage2_data = lgd_stage2_wf_wadj,
-    score_hist = lgd_stage_all_wf,
-    score_oot = &OOT_data,
-    id_var = loan_number,
-    date_var = def_date,
-    lgd_var = lgd_36m,
-    stage1_vars = &stage1_vars,
-    stage2_vars = &stage2_vars,
-    outprefix = tg_
+stage1_data =
+, stage2_data =
+, score_hist  =
+, score_oot   =
+, id_var      = loan_number
+, date_var    = def_date
+, lgd_var     = lgd_36m
+, stage1_vars =
+, stage2_vars =
+, outprefix   = tg_
 );
 
-
-/* 1. Stage-1 model - Probability of loss */
-
-proc logistic data=&stage1_data outmodel=work.&outprefix.bout1;
-    model lgd_stage1(ref='1') = &stage1_vars / link=logit;
+/* 1. Stage-1 model - probability of loss ––––––––––– */
+proc logistic data=&stage1_data outmodel=&outprefix.bout1;
+model lgd_stage1(event=‘1’) = &stage1_vars / link=logit;
 run;
 
-
-
-/* 2. Stage-2 model - E(LGD | loss) */
-
-proc logistic data=&stage2_data outmodel=work.&outprefix.bout2;
-    model algd_adj(event='1') = &stage2_vars / link=logit;
-    weight wt;
+/* 2. Stage-2 model - E(LGD | loss) –––––––––––––– */
+proc logistic data=&stage2_data outmodel=&outprefix.bout2;
+model algd_adj(event=‘1’) = &stage2_vars / link=logit;
+weight wt;
 run;
 
-
-
-/* 3. Score HIST portfolio */
-
+/* 3. Score HIST portfolio ———————————–– */
 /* Score Stage 1 model */
-proc logistic inmodel=work.&outprefix.bout1 noprint;
-    score data=&score_hist out=work.&outprefix.s1_hist fitstat;
+proc logistic inmodel=&outprefix.bout1 noprint;
+score data=&score_hist out=&outprefix.s1_hist fitstat;
 run;
 
 /* Score Stage 2 model */
-proc logistic inmodel=work.&outprefix.bout2 noprint;
-    score data=&score_hist out=work.&outprefix.s2_hist fitstat;
+proc logistic inmodel=&outprefix.bout2 noprint;
+score data=&score_hist out=&outprefix.s2_hist fitstat;
 run;
-
-
 
 /* Sort both datasets */
-
-proc sort data=work.&outprefix.s1_hist; 
-    by &id_var; 
-run;
-
-proc sort data=work.&outprefix.s2_hist; 
-    by &id_var; 
-run;
-
-
+proc sort data=&outprefix.s1_hist; by &id_var; run;
+proc sort data=&outprefix.s2_hist; by &id_var; run;
 
 /* Create final scored dataset */
-
-data work.&outprefix.scored_hist;
-    merge work.&outprefix.s1_hist (rename=(P_2=p_loss))
-          work.&outprefix.s2_hist (rename=(P_1=p_lgd));
-    by &id_var;
+data &outprefix.scored_hist;
+merge &outprefix.s1_hist(rename=(P_2=p_loss) keep=&id_var P_2)
+&outprefix.s2_hist(rename=(P_1=p_lgd) keep=&id_var P_1);
+by &id_var;
 run;
-
-
 
 /* Sort and merge with original data */
+proc sort data=&score_hist; by &id_var; run;
+proc sort data=&outprefix.scored_hist; by &id_var; run;
 
-proc sort data=&score_hist; 
-    by &id_var; 
+data &outprefix.scored_hist;
+merge &score_hist &outprefix.scored_hist;
+by &id_var;
+
+```
+/* Create binary flags if missing */
+if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+
+/* Final prediction - now we know p_loss and p_lgd are for same loan */
+pred_lgd = p_loss * p_lgd;
+```
+
 run;
 
-proc sort data=work.&outprefix.scored_hist; 
-    by &id_var; 
-run;
-
-data work.&outprefix.scored_hist;
-    merge &score_hist work.&outprefix.scored_hist;
-    by &id_var;
-
-    /* Create binary flags if missing or not present */
-    lgd_stage1 = coalesce(lgd_stage1, (&lgd_var > 0));
-    algd_adj = coalesce(algd_adj, (&lgd_var > 0));
-
-    /* Final prediction */
-    pred_lgd = p_loss * p_lgd;
-run;
-
-
-
-/* 4. Score OOT portfolio */
-
+/* 4. Score OOT portfolio ––––––––––––––––––– */
 /* Score Stage 1 model */
-proc logistic inmodel=work.&outprefix.bout1 noprint;
-    score data=&score_oot out=work.&outprefix.s1_oot fitstat;
+proc logistic inmodel=&outprefix.bout1 noprint;
+score data=&score_oot out=&outprefix.s1_oot fitstat;
 run;
 
 /* Score Stage 2 model */
-proc logistic inmodel=work.&outprefix.bout2 noprint;
-    score data=&score_oot out=work.&outprefix.s2_oot fitstat;
+proc logistic inmodel=&outprefix.bout2 noprint;
+score data=&score_oot out=&outprefix.s2_oot fitstat;
 run;
-
-
 
 /* Sort both datasets */
-
-proc sort data=work.&outprefix.s1_oot; 
-    by &id_var; 
-run;
-
-proc sort data=work.&outprefix.s2_oot; 
-    by &id_var; 
-run;
-
-
+proc sort data=&outprefix.s1_oot; by &id_var; run;
+proc sort data=&outprefix.s2_oot; by &id_var; run;
 
 /* Create final scored dataset */
-
-data work.&outprefix.scored_oot;
-    merge work.&outprefix.s1_oot (rename=(P_2=p_loss))
-          work.&outprefix.s2_oot (rename=(P_1=p_lgd));
-    by &id_var;
+data &outprefix.scored_oot;
+merge &outprefix.s1_oot(rename=(P_2=p_loss) keep=&id_var P_2)
+&outprefix.s2_oot(rename=(P_1=p_lgd) keep=&id_var P_1);
+by &id_var;
 run;
-
-
 
 /* Sort and merge with original data */
+proc sort data=&score_oot; by &id_var; run;
+proc sort data=&outprefix.scored_oot; by &id_var; run;
 
-proc sort data=&score_oot; 
-    by &id_var; 
+data &outprefix.scored_oot;
+merge &score_oot &outprefix.scored_oot;
+by &id_var;
+
+```
+/* Create binary flags if missing */
+if missing(lgd_stage1) then lgd_stage1 = (&lgd_var > 0);
+if missing(algd_adj) then algd_adj = (&lgd_var > 0);
+
+/* Final prediction - now we know p_loss and p_lgd are for same loan */
+pred_lgd = p_loss * p_lgd;
+```
+
 run;
 
-proc sort data=work.&outprefix.scored_oot; 
-    by &id_var; 
+/* 5. Build per-stage full tables —————————— */
+data &outprefix.s1_hist_full;
+set &outprefix.scored_hist;
+/* Keep only relevant variables for stage 1 analysis */
 run;
 
-data work.&outprefix.scored_oot;
-    merge &score_oot work.&outprefix.scored_oot;
-    by &id_var;
-
-    /* Create binary flags if missing or not present */
-    lgd_stage1 = coalesce(lgd_stage1, (&lgd_var > 0));
-    algd_adj = coalesce(algd_adj, (&lgd_var > 0));
-
-    /* Final prediction */
-    pred_lgd = p_loss * p_lgd;
+data &outprefix.s2_hist_full;
+set &outprefix.scored_hist;
+/* Keep only relevant variables for stage 2 analysis */
 run;
 
-
-
-/* 5. Build per-stage full tables */
-
-data work.&outprefix.s1_hist_full;
-    set work.&outprefix.scored_hist;
-    /* Keep all variables for stage 1 analysis */
+data &outprefix.s1_oot_full;
+set &outprefix.scored_oot;
+/* Keep only relevant variables for stage 1 analysis */
 run;
 
-data work.&outprefix.s2_hist_full;
-    set work.&outprefix.scored_hist;
-    /* Keep all variables for stage 2 analysis */
+data &outprefix.s2_oot_full;
+set &outprefix.scored_oot;
+/* Keep only relevant variables for stage 2 analysis */
 run;
 
-data work.&outprefix.s1_oot_full;
-    set work.&outprefix.scored_oot;
-    /* Keep all variables for stage 1 analysis */
-run;
-
-data work.&outprefix.s2_oot_full;
-    set work.&outprefix.scored_oot;
-    /* Keep all variables for stage 2 analysis */
-run;
-
-
-
-/* 6. Performance metrics */
-
-%macro pm(ds=, act=, pred=, ttl=, filter=);
-
+/* 6. Performance metrics ––––––––––––––––––– */
+%macro _pm(ds=, act=, pred=, ttl=);
 /* Create aggregated data for performance metrics */
 proc means data=&ds noprint;
-    where &filter;
-    class &date_var;
-    var &act &pred;
-    output out=work.&ds._compare (where=(_stat_="MEAN" and &date_var^=.)) mean=;
+class &date_var;
+var &act &pred;
+output out=&ds._compare(where=(*stat*=“MEAN” and &date_var^=.));
 run;
 
-data work.&ds._compare;
-    set work.&ds._compare;
-    Type="&ttl";
+```
+data &ds._compare;
+    set &ds._compare;
+    Type="HIST";
 run;
 
 title "&ttl";
+%performance_metrics(data_=&ds._compare, actual_var=&act, pred_var=&pred);
+title;
+```
 
-%mend pm;
+%mend;
 
+%_pm(ds=&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss,
+ttl=Stage-1 HIST);
+%_pm(ds=&outprefix.s2_hist_full, act=algd_adj, pred=p_lgd,
+ttl=Stage-2 HIST);
+%_pm(ds=&outprefix.scored_hist, act=&lgd_var, pred=pred_lgd,
+ttl=Combined HIST);
 
-
-/* Stage 1 metrics - all observations */
-%pm(ds=work.&outprefix.s1_hist_full, act=lgd_stage1, pred=p_loss, ttl=Stage-1 HIST);
-
-
-
-/* Stage 1 metrics - all observations */
-%pm(ds=work.&outprefix.s1_oot_full, act=lgd_stage1, pred=p_loss, ttl=Stage-1 OOT);
-
-
-
-/* Stage 2 metrics - ONLY observations where actual LGD > 0 */
-%pm(ds=work.&outprefix.s2_hist_full, act=algd_adj, pred=p_lgd, ttl=Stage-2 HIST, filter=&lgd_var > 0);
-
-
-
-/* Stage 2 metrics - ONLY observations where actual LGD > 0 */
-%pm(ds=work.&outprefix.s2_oot_full, act=algd_adj, pred=p_lgd, ttl=Stage-2 OOT, filter=&lgd_var > 0);
-
-
-
-/* Combined metrics - all observations */
-%pm(ds=work.&outprefix.scored_hist, act=&lgd_var, pred=pred_lgd, ttl=Combined HIST);
-
-
-
-/* Combined metrics - all observations */
-%pm(ds=work.&outprefix.scored_oot, act=&lgd_var, pred=pred_lgd, ttl=Combined OOT);
-
-
+%_pm(ds=&outprefix.s1_oot_full, act=lgd_stage1, pred=p_loss,
+ttl=Stage-1 OOT);
+%_pm(ds=&outprefix.s2_oot_full, act=algd_adj, pred=p_lgd,
+ttl=Stage-2 OOT);
+%_pm(ds=&outprefix.scored_oot, act=&lgd_var, pred=pred_lgd,
+ttl=Combined OOT);
 
 %mend twostage_lgd;
