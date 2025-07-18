@@ -80,18 +80,6 @@
       run;
    %end;
 
-   /* check if datevar exists in combined_data */
-   %let has_datevar = 0;
-   proc contents data=combined_data out=_contents (keep=name) noprint;
-   run;
-   data _null_;
-      set _contents;
-      if upcase(name) = upcase("&datevar") then call symputx('has_datevar', '1');
-   run;
-   proc datasets lib=work nolist;
-      delete _contents;
-   quit;
-
    /* initialize the final output datasets */
    data &outbase._pred;
       length sample $10 model $10;
@@ -114,9 +102,12 @@
       %let model = %upcase(%scan(&models,&i));
       %put Running &model model...;
 
-      /* prep data specific to each model */
+      /* prep data specific to each model - add unique ID */
       data work_data;
          set combined_data;
+         
+         /* create unique observation ID for merging later */
+         obs_id = _n_;
          
          %if &model = BR %then %do;
             /* beta regression needs open interval (0,1) */
@@ -148,10 +139,6 @@
       %end;
 
       %else %if &model = CG %then %do;
-         /* build dynamic keep list for nlmix_out */
-         %let keep_list = sample &depvar pred;
-         %if &has_datevar = 1 %then %let keep_list = &keep_list &datevar;
-
          /* censored gamma model */
          proc nlmixed data=work_data tech=newrap qpoints=1 maxiter=200;
             parms beta0=0
@@ -180,11 +167,14 @@
                ll = log(pdf('gamma', &depvar, alpha, scale));
 
             model &depvar ~ general(ll);
-            predict mu out=nlmix_out(rename=(pred=pred_lgd) keep=&keep_list);
+            predict mu out=nlmix_pred(rename=(pred=pred_lgd));
          run;
          
+         /* merge predictions back with original data to get all variables */
          data current_pred;
-            set nlmix_out;
+            merge work_data(keep=obs_id sample &datevar &depvar) 
+                  nlmix_pred(keep=obs_id pred_lgd);
+            by obs_id;
             length model $10;
             model = "&model";
             residual = &depvar - pred_lgd;
@@ -221,10 +211,6 @@
             predict mu out=nlmix_out(rename=(pred=pred_lgd));
          run;
          
-         /* build dynamic keep list for current_pred */
-         %let keep_list = sample &depvar pred_lgd model residual abs_residual;
-         %if &has_datevar = 1 %then %let keep_list = &keep_list &datevar;
-
          data current_pred;
             set nlmix_out;
             length model $10;
@@ -233,7 +219,8 @@
             abs_residual = abs(residual);
             if pred_lgd < 0 then pred_lgd = 0;
             if pred_lgd > 1 then pred_lgd = 1;
-            keep &keep_list;
+            /* make sure to keep the date variable */
+            keep sample &datevar &depvar pred_lgd model residual abs_residual;
          run;
       %end;
 
@@ -278,81 +265,75 @@
          length model $10;
          model = "&model";
          if missing(correlation) then correlation = 0;
-         format bias mae rmse correlation 8.4;
+         format bias rmse mae correlation 8.4;
          keep model sample n_obs bias rmse mae correlation;
+      run;
+
+      /* date level aggregation - sort first */
+      proc sort data=current_pred;
+         by &datevar sample;
+      run;
+      
+      proc means data=current_pred noprint;
+         class &datevar sample;
+         var &depvar pred_lgd;
+         output out=avg_temp(where=(&datevar ne . and sample ne ''))
+                mean(&depvar)=actual_lgd 
+                mean(pred_lgd)=pred_lgd
+                n=n_obs;
+      run;
+
+      data current_avg; 
+         set avg_temp;
+         length model $10;
+         model = "&model"; 
+         format actual_lgd pred_lgd 8.4;
+         keep model &datevar sample actual_lgd pred_lgd n_obs;
       run;
 
       /* append results */
       proc append base=&outbase._pred data=current_pred force; run;
       proc append base=&outbase._metrics data=current_metrics force; run;
+      proc append base=&outbase._compare data=current_avg force; run;
 
-      %if &has_datevar = 1 %then %do;
-         /* date level aggregation - sort first */
-         proc sort data=current_pred;
-            by &datevar sample;
-         run;
-      
-         proc means data=current_pred noprint;
-            class &datevar sample;
-            var &depvar pred_lgd;
-            output out=avg_temp(where=(&datevar ne . and sample ne ''))
-                   mean(&depvar)=actual_lgd 
-                   mean(pred_lgd)=pred_lgd
-                   n=n_obs;
-         run;
-
-         data current_avg;
-            set avg_temp;
-            length model $10;
-            model = "&model"; 
-            format actual_lgd pred_lgd 8.4;
-            keep model &datevar sample actual_lgd pred_lgd n_obs;
-         run;
-
-         /* append results */
-         proc append base=&outbase._compare data=current_avg force; run;
-      %end;
-      %else %put NOTE: Date variable &datevar does not exist in the dataset. Skipping time-series aggregation and plotting.;
    %end;
 
-   %if &has_datevar = 1 %then %do;
-      /* create combined backtesting plot with reference line */
-      data plot_data;
-         set &outbase._compare;
+   /* create combined backtesting plot with reference line */
+   data plot_data;
+      set &outbase._compare;
       
-         /* create separate series for actual and predicted by sample */
-         length series_name $50;
+      /* create separate series for actual and predicted by sample */
+      length series_name $50;
       
-         /* actual values */
-         value = actual_lgd;
-         series_name = catx(' ', 'Actual', sample);
-         output;
+      /* actual values */
+      value = actual_lgd;
+      series_name = catx(' ', 'Actual', sample);
+      output;
       
-         /* predicted values */
-         value = pred_lgd;
-         series_name = catx(' ', 'Predicted', sample);
-         output;
+      /* predicted values */
+      value = pred_lgd;
+      series_name = catx(' ', 'Predicted', sample);
+      output;
       
-         keep &datevar value series_name model sample;
-      run;
+      keep &datevar value series_name model sample;
+   run;
 
-      /* create the combined plot for each model */
-      %do i = 1 %to &nmodels;
-         %let model = %upcase(%scan(&models,&i));
+   /* create the combined plot for each model */
+   %do i = 1 %to &nmodels;
+      %let model = %upcase(%scan(&models,&i));
       
-         ods graphics / reset width=12in height=8in;
-         proc sgplot data=plot_data(where=(model="&model"));
-            series x=&datevar y=value / group=series_name
-                   lineattrs=(thickness=2)
-                   markers markerattrs=(size=4);
-            refline '30APR2020'd / axis=x lineattrs=(pattern=dash color=black thickness=2)
-                                   label="Reference Date";
-            xaxis label="Default Date" valueattrs=(size=10pt);
-            yaxis label="LGD Level" valueattrs=(size=10pt) min=0 max=1;
-            keylegend / position=topright across=1;
-            title "&model Model - Train vs OOT Performance" height=14pt;
-         run;
-      %end;
+      ods graphics / reset width=12in height=8in;
+      proc sgplot data=plot_data(where=(model="&model"));
+         series x=&datevar y=value / group=series_name
+                lineattrs=(thickness=2)
+                markers markerattrs=(size=4);
+         refline '30APR2020'd / axis=x lineattrs=(pattern=dash color=black thickness=2)
+                                legendlabel="Reference Date" name="RefLine";
+         xaxis label="Default Date" valueattrs=(size=10pt);
+         yaxis label="LGD Level" valueattrs=(size=10pt) min=0 max=1;
+         keylegend / position=topright across=1;
+         title "&model Model - Train vs OOT Performance" height=14pt;
+      run;
    %end;
 
    /* show final results */
@@ -363,8 +344,19 @@
 
    /* cleanup temp datasets */
    proc datasets lib=work nolist;
-      delete combined_data work_data pred_out nlmix_out current_: 
+      delete combined_data work_data current_: 
              corr_out corr_values metrics_temp avg_temp plot_data vif_results;
    quit;
 
 %mend lgd_censored;
+
+
+%lgd_censored(
+   train=lgd_training_data,
+   oot=lgd_oot_data, 
+   depvar=lgd_36M,
+   indep=&all_vars,
+   datevar=def_date,
+   models=TOBIT CG BR,
+   outbase=lgd_results
+);
