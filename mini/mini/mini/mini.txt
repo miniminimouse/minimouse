@@ -1,45 +1,60 @@
 /*---------------------------------------------------------------*/
-/* lgd_model2.sas – censored-gamma / beta regression macro       */
+/* lgd_model2.sas – one-stop lgd engine (censored gamma + beta)  */
+/*---------------------------------------------------------------*/
+/* what it does                                                  */
+/* 1. stacks train + oot into one file with a sample flag         */
+/* 2. fits censored-gamma (cg) and/or beta regression (br)        */
+/* 3. kicks out record preds, residual stats, date-level averages */
+/* 4. draws a back-testing chart (actual vs pred) per model       */
+/* 5. saves three tidy tables: _pred  _metrics  _compare          */
 /*---------------------------------------------------------------*/
 %macro lgd_model2(
-      train=,          /* training dataset                         */
-      oot=,            /* out-of-time dataset                      */
-      depvar=,         /* target lgd variable                      */
-      indep=,          /* predictor list (space separated)         */
-      models=CG BR,    /* which engines: CG, BR, or both           */
-      outbase=lgd_out  /* stem for output tables                   */
+      train= ,          /* training dataset                        */
+      oot=   ,          /* out-of-time dataset                     */
+      depvar= ,         /* target lgd variable                     */
+      indep=  ,         /* space-sep list of predictors            */
+      datevar=def_date, /* date to aggregate by (default def_date) */
+      models=CG BR,     /* which engines – CG, BR, or both         */
+      outbase=lgd_out   /* stem for output tables                  */
    );
 
-   %let eps = 1e-6;    /* small jitter for beta regression         */
+   %let eps = 1e-6;     /* tiny jitter to keep log() finite        */
 
-   /* 1. stack the two samples and mark them                       */
+   /*------------------------------------------------------------*/
+   /* 0. prep – stack train + oot                                */
+   /*------------------------------------------------------------*/
    data _cmb;
       set &train(in=intrain) &oot(in=inoot);
       length sample $5;
-      if intrain then sample = 'TRAIN';
-      else if inoot then sample = 'OOT';
+      if intrain then sample='TRAIN';
+      else if inoot then sample='OOT';
    run;
 
-   /* loop over requested model list                               */
+   /* loop over requested model list                             */
    %let nmodels = %sysfunc(countw(&models));
    %do i = 1 %to &nmodels;
       %let thismodel = %upcase(%scan(&models,&i));
-      %put NOTE: running &thismodel.;
+      %put NOTE: **** running &thismodel. ****;
 
-      /* 1a. prep jitter for beta regression                        */
+      /*---------------------------------------------------------*/
+      /* 1. prep data for this model                             */
+      /*---------------------------------------------------------*/
       data _work_in;
          set _cmb;
          model = "&thismodel";
+         /* jitter exact 0/1 for beta regression */
          %if &thismodel = BR %then %do;
             if &depvar = 0 then &depvar = &eps;
             else if &depvar = 1 then &depvar = 1-&eps;
          %end;
       run;
 
-      /* 2. censored gamma                                          */
+      /*---------------------------------------------------------*/
+      /* 2a. censored gamma                                      */
+      /*---------------------------------------------------------*/
       %if &thismodel = CG %then %do;
          proc nlmixed data=_work_in tech=newrap qpoints=1 maxiter=500;
-            /* params */
+            /* parameter list */
             parms beta0=0;
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
@@ -53,14 +68,14 @@
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
                + b&j.*%scan(&indep,&j)
-               %let j = %eval(&j+1);
+               %let j=%eval(&j+1);
             %end;
             ;
-            mu    = exp(eta);
-            alpha = exp(logalpha);
+            mu    = exp(eta);            /* mean > 0 */
+            alpha = exp(logalpha);       /* shape > 0 */
             scale = mu / alpha;
 
-            /* censored gamma ll */
+            /* censored gamma log-likelihood (two-sided) */
             if      &depvar <  &eps then ll = log(gamcdf(&eps ,alpha,scale));
             else if &depvar > 1-&eps then ll = log(1 - gamcdf(1-&eps ,alpha,scale));
             else ll = log(gampdf(&depvar ,alpha,scale));
@@ -70,7 +85,9 @@
          run;
       %end;
 
-      /* 3. beta regression                                         */
+      /*---------------------------------------------------------*/
+      /* 2b. beta regression                                     */
+      /*---------------------------------------------------------*/
       %else %if &thismodel = BR %then %do;
          proc nlmixed data=_work_in tech=newrap qpoints=1 maxiter=500;
             parms beta0=0;
@@ -79,13 +96,13 @@
                parms b&j.=0;
                %let j = %eval(&j+1);
             %end;
-            parms logphi=0;
+            parms logphi=0;              /* precision > 0 */
 
             eta = beta0
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
                + b&j.*%scan(&indep,&j)
-               %let j = %eval(&j+1);
+               %let j=%eval(&j+1);
             %end;
             ;
             mu  = 1 / (1 + exp(-eta));
@@ -99,14 +116,19 @@
          run;
       %end;
 
-      /* 4. residuals and metrics                                   */
+      /*---------------------------------------------------------*/
+      /* 3. residuals + record-level preds                       */
+      /*---------------------------------------------------------*/
       data _pred_&thismodel;
          set _pred_&thismodel;
-         keep sample model &depvar pred_lgd;
+         keep sample model &datevar &depvar pred_lgd;
          residual     = &depvar - pred_lgd;
          abs_residual = abs(residual);
       run;
 
+      /*---------------------------------------------------------*/
+      /* 4. metrics by sample (train vs oot)                     */
+      /*---------------------------------------------------------*/
       proc sql noprint;
          create table _metrics_&thismodel as
          select
@@ -120,22 +142,55 @@
          group by sample;
       quit;
 
-      /* 5. stack results                                            */
+      /*---------------------------------------------------------*/
+      /* 5. aggregate by date for back-testing plot              */
+      /*---------------------------------------------------------*/
+      proc means data=_pred_&thismodel noprint;
+         class &datevar;
+         var &depvar pred_lgd;
+         output out=_avg_&thismodel
+                (where=(_stat_='MEAN' and &datevar ne .))
+                mean=act_lgd pred_lgd;
+      run;
+
+      /* add model col and stack */
+      data _avg_&thismodel; set _avg_&thismodel; model="&thismodel"; run;
+
+      /*---------------------------------------------------------*/
+      /* 6. append results to master tables                      */
+      /*---------------------------------------------------------*/
       %if &i = 1 %then %do;
          data &outbase._pred;    set _pred_&thismodel;    run;
          data &outbase._metrics; set _metrics_&thismodel; run;
+         data &outbase._compare; set _avg_&thismodel;     run;
       %end;
       %else %do;
-         proc append base=&outbase._pred    data=_pred_&thismodel   force; run;
+         proc append base=&outbase._pred    data=_pred_&thismodel    force; run;
          proc append base=&outbase._metrics data=_metrics_&thismodel force; run;
+         proc append base=&outbase._compare data=_avg_&thismodel     force; run;
       %end;
 
-   %end; /* model loop */
+      /*---------------------------------------------------------*/
+      /* 7. back-testing plot (pred vs actual)                   */
+      /*---------------------------------------------------------*/
+      ods graphics / reset width=12in height=8in;
+      proc sgplot data=_avg_&thismodel;
+         series x=&datevar y=act_lgd  / lineattrs=(thickness=2) legendlabel="actual";
+         series x=&datevar y=pred_lgd / lineattrs=(thickness=2) legendlabel="predicted";
+         xaxis label="default date";
+         yaxis label="lgd level";
+         refline '30APR2020'd / axis=x lineattrs=(pattern=dash color=black thickness=2)
+                                legendlabel="reference date" name="RefLine";
+         keylegend / position=topright across=1;
+         title "back-testing – &thismodel.";
+      run;
+
+   %end;  /* end model loop */
 
 %mend lgd_model2;
 
 /*---------------------------------------------------------------*/
-/* example call                                                  */
+/* example call – tweak as needed                                */
 /*---------------------------------------------------------------*/
 %let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
                 Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
@@ -146,6 +201,7 @@
    oot=score_oot,
    depvar=model_lgd,
    indep=&all_vars,
-   models=CG BR,
-   outbase=lgd_run2
+   datevar=def_date,     /* change if your date column differs     */
+   models=CG BR,         /* run both engines                       */
+   outbase=lgd_run3      /* outputs: lgd_run3_pred metrics compare */
 );
