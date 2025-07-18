@@ -1,356 +1,165 @@
-/* lgd_censored.sas - comprehensive lgd modeling framework */
-/* fits tobit, censored gamma, and beta regression models */
-
+/* lgd_censored.sas – fits TOBIT, censored-gamma, beta regression */
 %macro lgd_censored(
-      train= ,          
-      oot=   ,          
-      depvar= ,         
-      indep=  ,         
-      datevar=def_date, 
-      models=TOBIT CG BR,     
-      outbase=lgd_out   
+      train= ,
+      oot= ,
+      depvar= ,
+      indep= ,
+      datevar=def_date,
+      models=TOBIT CG BR,
+      outbase=lgd_out
    );
 
-   %let eps = 1e-6;     
+   %let eps = 1e-6;
 
-   /* count variables and clean up the list - remove duplicates */
-   %let var_count = %sysfunc(countw(&indep));
-   %put Processing &var_count predictor variables;
-   
-   /* create clean variable list without duplicates */
-   %let clean_indep = ;
-   %do j = 1 %to &var_count;
-      %let thisvar = %scan(&indep,&j);
-      %if %index(&clean_indep,&thisvar) = 0 %then %do;
-         %let clean_indep = &clean_indep &thisvar;
-      %end;
+   /* clean predictor list */
+   %let clean_indep=;
+   %do _i=1 %to %sysfunc(countw(&indep));
+      %let v=%scan(&indep,&_i);
+      %if %index(%upcase(&clean_indep),%upcase(&v))=0 %then
+         %let clean_indep=&clean_indep &v;
    %end;
-   %let clean_indep = %sysfunc(strip(&clean_indep));
-   %let var_count = %sysfunc(countw(&clean_indep));
-   %put Clean variable list: &clean_indep;
-   %put Final variable count: &var_count;
+   %let clean_indep=%sysfunc(compbl(&clean_indep));
 
-   /* basic data stacking and prep */
-   data combined_data;
-      length sample $10;
+   /* stack data */
+   data _cmb;
+      length sample $6;
       set &train(in=a) &oot(in=b);
-      
-      if a then sample='TRAIN';
-      else if b then sample='OOT';
-      
-      /* remove missing or out of bounds observations */
-      if missing(&depvar) then delete;
-      if &depvar < 0 or &depvar > 1 then delete;
-      
-      /* check for missing predictors */
-      if nmiss(of &clean_indep) > 0 then delete;
+      sample=ifc(a,'TRAIN','OOT');
+      if missing(&depvar) or &depvar<0 or &depvar>1 then delete;
+      if nmiss(of &clean_indep) then delete;
    run;
 
-   /* quick data summary */
-   proc sql noprint;
-      select count(*) into :total_obs from combined_data;
-      select count(*) into :train_obs from combined_data where sample='TRAIN';
-      select count(*) into :oot_obs from combined_data where sample='OOT';
-   quit;
+   /* vif check (train only) */
+   proc reg data=_cmb(where=(sample='TRAIN')) noprint;
+      model &depvar=&clean_indep / vif;
+   run; quit;
 
-   %put Dataset summary - Total: &total_obs, Train: &train_obs, OOT: &oot_obs;
+   /* setup output shells */
+   data &outbase._pred &outbase._metrics &outbase._compare; stop; run;
 
-   /* check multicollinearity with vif values - training data only */
-   proc reg data=combined_data(where=(sample='TRAIN'));
-      model &depvar = &clean_indep / vif;
-      ods output ParameterEstimates=vif_results;
-   run;
-   quit;
+   %let nmod=%sysfunc(countw(&models));
+   %do _m=1 %to &nmod;
+      %let mdl=%upcase(%scan(&models,&_m));
 
-   /* show vif results if dataset exists */
-   %if %sysfunc(exist(vif_results)) %then %do;
-      proc print data=vif_results noobs;
-         title "VIF Analysis - Multicollinearity Check";
-         var Variable Estimate StdErr tValue Probt VarianceInflation;
-         where Variable ne 'Intercept';
-         format Estimate StdErr 8.4 tValue 8.2 Probt 8.4 VarianceInflation 8.2;
-      run;
-
-      /* flag high vif variables */
-      data _null_;
-         set vif_results;
-         where Variable ne 'Intercept' and VarianceInflation > 5;
-         if _n_ = 1 then put "WARNING: Variables with VIF > 5 detected:";
-         put Variable "VIF=" VarianceInflation 8.2;
-      run;
-   %end;
-
-   /* initialize the final output datasets */
-   data &outbase._pred;
-      length sample $10 model $10;
-      stop;
-   run;
-   
-   data &outbase._metrics;
-      length model $10 sample $10;
-      stop;
-   run;
-   
-   data &outbase._compare;
-      length model $10 sample $10;
-      stop;
-   run;
-
-   /* loop through each model */
-   %let nmodels = %sysfunc(countw(&models));
-   %do i = 1 %to &nmodels;
-      %let model = %upcase(%scan(&models,&i));
-      %put Running &model model...;
-
-      /* prep data specific to each model */
-      data work_data;
-         set combined_data;
-         
-         %if &model = BR %then %do;
-            /* beta regression needs open interval (0,1) */
-            if &depvar = 0 then &depvar = &eps;
-            else if &depvar = 1 then &depvar = 1-&eps;
+      /* jitter for beta */
+      data _work;
+         set _cmb;
+         %if &mdl=BR %then %do;
+            if &depvar=0 then &depvar=&eps;
+            else if &depvar=1 then &depvar=1-&eps;
          %end;
       run;
 
-      /* run the appropriate model */
-      %if &model = TOBIT %then %do;
-         /* tobit model using proc qlim */
-         proc qlim data=work_data;
-            model &depvar = &clean_indep;
+      %if &mdl=TOBIT %then %do;
+         proc qlim data=_work;
+            model &depvar=&clean_indep;
             endogenous &depvar ~ censored(lb=0 ub=1);
-            output out=pred_out predicted marginal;
-         run;
-         
-         /* create predictions dataset */
-         data current_pred;
-            set pred_out;
-            length model $10;
-            model = "&model";
-            pred_lgd = p_&depvar;
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
+            output out=_pred predicted=pred_lgd;
          run;
       %end;
-
-      %else %if &model = CG %then %do;
-         /* censored gamma model */
-         proc nlmixed data=work_data tech=newrap qpoints=1 maxiter=200;
-            parms beta0=0
-            %do j=1 %to &var_count;
-               b&j=0
-            %end;
-            logalpha=0;
-
-            /* build linear predictor */
-            eta = beta0;
-            %do j=1 %to &var_count;
-               %let thisvar = %scan(&clean_indep,&j);
-               eta = eta + b&j * &thisvar;
-            %end;
-            
-            mu = exp(eta);
-            alpha = exp(logalpha);
-            scale = mu / alpha;
-
-            /* censored gamma log-likelihood */
-            if &depvar <= &eps then 
-               ll = log(cdf('gamma', &eps, alpha, scale));
-            else if &depvar >= 1-&eps then 
-               ll = log(1 - cdf('gamma', 1-&eps, alpha, scale));
-            else 
-               ll = log(pdf('gamma', &depvar, alpha, scale));
-
+      %else %if &mdl=CG %then %do;
+         proc nlmixed data=_work tech=newrap qpoints=1 maxiter=300;
+            parms beta0=0 %do j=1 %to %sysfunc(countw(&clean_indep)); b&j=0 %end; logalpha=0;
+            eta=beta0
+            %do j=1 %to %sysfunc(countw(&clean_indep)); +b&j*%scan(&clean_indep,&j) %end; ;
+            mu=exp(eta); alpha=exp(logalpha); scale=mu/alpha;
+            if &depvar<=&eps then ll=log(cdf('gamma',&eps,alpha,scale));
+            else if &depvar>=1-&eps then ll=log(1-cdf('gamma',1-&eps,alpha,scale));
+            else ll=log(pdf('gamma',&depvar,alpha,scale));
             model &depvar ~ general(ll);
-            predict mu out=nlmix_out(rename=(pred=pred_lgd) keep=sample &datevar &depvar pred);
-         run;
-         
-         data current_pred;
-            set nlmix_out;
-            length model $10;
-            model = "&model";
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
+            predict mu out=_pred(rename=(pred=pred_lgd));
          run;
       %end;
-
-      %else %if &model = BR %then %do;
-         /* beta regression model */
-         proc nlmixed data=work_data tech=newrap qpoints=1 maxiter=200;
-            parms beta0=0
-            %do j=1 %to &var_count;
-               b&j=0
-            %end;
-            logphi=0;
-
-            /* linear predictor */
-            eta = beta0;
-            %do j=1 %to &var_count;
-               %let thisvar = %scan(&clean_indep,&j);
-               eta = eta + b&j * &thisvar;
-            %end;
-            
-            mu = exp(eta) / (1 + exp(eta));
-            phi = exp(logphi);
-
-            /* beta distribution log-likelihood */
-            ll = lgamma(phi) - lgamma(mu*phi) - lgamma((1-mu)*phi) +
-                 (mu*phi-1)*log(&depvar) + ((1-mu)*phi-1)*log(1-&depvar);
-
+      %else %if &mdl=BR %then %do;
+         proc nlmixed data=_work tech=newrap qpoints=1 maxiter=300;
+            parms beta0=0 %do j=1 %to %sysfunc(countw(&clean_indep)); b&j=0 %end; logphi=0;
+            eta=beta0
+            %do j=1 %to %sysfunc(countw(&clean_indep)); +b&j*%scan(&clean_indep,&j) %end; ;
+            mu=1/(1+exp(-eta)); phi=exp(logphi);
+            ll=lgamma(phi)-lgamma(mu*phi)-lgamma((1-mu)*phi)
+               +(mu*phi-1)*log(&depvar)+((1-mu)*phi-1)*log(1-&depvar);
             model &depvar ~ general(ll);
-            predict mu out=nlmix_out(rename=(pred=pred_lgd));
-         run;
-         
-         data current_pred;
-            set nlmix_out;
-            length model $10;
-            model = "&model";
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
-            /* make sure to keep the date variable */
-            keep sample &datevar &depvar pred_lgd model residual abs_residual;
+            predict mu out=_pred(rename=(pred=pred_lgd));
          run;
       %end;
 
-      /* sort data for by processing */
-      proc sort data=current_pred;
-         by sample;
+      /* merge preds with keys */
+      proc sql;
+         create table _pred2 as
+         select a.sample,a.&datevar,a.&depvar,b.pred_lgd,"&mdl" as model
+         from _work(drop=&depvar) a
+         left join _pred b
+         on a._n_=b._n_;
+      quit;
+
+      data _pred2;
+         set _pred2;
+         residual=&depvar-pred_lgd;
+         abs_residual=abs(residual);
       run;
 
-      /* calculate correlation using proc corr */
-      proc corr data=current_pred noprint outp=corr_out;
+      /* metrics */
+      proc sql;
+         create table _met as
+         select "&mdl" as model,length(sample)=length(sample),
+                sample,
+                count(*) as n_obs,
+                mean(residual) as bias format=8.4,
+                sqrt(mean(residual*residual)) as rmse format=8.4,
+                mean(abs_residual) as mae format=8.4
+         from _pred2
+         group by sample;
+      quit;
+
+      proc corr data=_pred2 noprint outp=_c(where=(_type_='CORR'));
+         by sample;
          var &depvar pred_lgd;
-         by sample;
       run;
 
-      /* get correlation value */
-      data corr_values;
-         set corr_out;
-         if _type_ = 'CORR' and _name_ = "&depvar";
-         correlation = pred_lgd;
+      data _c;
+         set _c;
+         if _name_="&depvar";
+         rename pred_lgd=correlation;
          keep sample correlation;
       run;
 
-      /* calculate other metrics using simple means */
-      proc means data=current_pred noprint;
-         class sample;
-         var residual abs_residual;
-         output out=metrics_temp(where=(sample ne ''))
-                mean(residual)=bias 
-                std(residual)=rmse
-                mean(abs_residual)=mae
-                n=n_obs;
-      run;
+      proc sql;
+         create table _met2 as
+         select a.*,coalesce(b.correlation,.) as correlation format=8.4
+         from _met a left join _c b using(sample);
+      quit;
 
-      /* combine metrics */
-      proc sort data=metrics_temp; by sample; run;
-      proc sort data=corr_values; by sample; run;
-      
-      data current_metrics;
-         merge metrics_temp(in=a) corr_values;
-         by sample;
-         if a;
-         length model $10;
-         model = "&model";
-         if missing(correlation) then correlation = 0;
-         format bias rmse mae correlation 8.4;
-         keep model sample n_obs bias rmse mae correlation;
-      run;
-
-      /* date level aggregation - sort first */
-      proc sort data=current_pred;
-         by &datevar sample;
-      run;
-      
-      proc means data=current_pred noprint;
+      /* date-level means */
+      proc means data=_pred2 nway noprint;
          class &datevar sample;
          var &depvar pred_lgd;
-         output out=avg_temp(where=(&datevar ne . and sample ne ''))
-                mean(&depvar)=actual_lgd 
-                mean(pred_lgd)=pred_lgd
-                n=n_obs;
+         output out=_avg mean(&depvar)=actual_lgd mean(pred_lgd)=pred_lgd;
       run;
 
-      data current_avg; 
-         set avg_temp;
-         length model $10;
-         model = "&model"; 
-         format actual_lgd pred_lgd 8.4;
-         keep model &datevar sample actual_lgd pred_lgd n_obs;
-      run;
+      data _avg; set _avg; model="&mdl"; run;
 
-      /* append results */
-      proc append base=&outbase._pred data=current_pred force; run;
-      proc append base=&outbase._metrics data=current_metrics force; run;
-      proc append base=&outbase._compare data=current_avg force; run;
+      /* append */
+      proc append base=&outbase._pred    data=_pred2 force; run;
+      proc append base=&outbase._metrics data=_met2  force; run;
+      proc append base=&outbase._compare data=_avg   force; run;
 
-   %end;
-
-   /* create combined backtesting plot with reference line */
-   data plot_data;
-      set &outbase._compare;
-      
-      /* create separate series for actual and predicted by sample */
-      length series_name $50;
-      
-      /* actual values */
-      value = actual_lgd;
-      series_name = catx(' ', 'Actual', sample);
-      output;
-      
-      /* predicted values */
-      value = pred_lgd;
-      series_name = catx(' ', 'Predicted', sample);
-      output;
-      
-      keep &datevar value series_name model sample;
-   run;
-
-   /* create the combined plot for each model */
-   %do i = 1 %to &nmodels;
-      %let model = %upcase(%scan(&models,&i));
-      
+      /* quick plot */
       ods graphics / reset width=12in height=8in;
-      proc sgplot data=plot_data(where=(model="&model"));
-         series x=&datevar y=value / group=series_name
-                lineattrs=(thickness=2)
-                markers markerattrs=(size=4);
-         refline '30APR2020'd / axis=x lineattrs=(pattern=dash color=black thickness=2)
-                                legendlabel="Reference Date" name="RefLine";
-         xaxis label="Default Date" valueattrs=(size=10pt);
-         yaxis label="LGD Level" valueattrs=(size=10pt) min=0 max=1;
-         keylegend / position=topright across=1;
-         title "&model Model - Train vs OOT Performance" height=14pt;
+      proc sgplot data=_avg;
+         series x=&datevar y=actual_lgd / group=sample;
+         series x=&datevar y=pred_lgd   / group=sample lineattrs=(pattern=dash);
+         refline '30APR2020'd / axis=x lineattrs=(pattern=dash);
+         xaxis label="default date"; yaxis label="lgd" min=0 max=1;
+         keylegend / position=topright;
+         title "&mdl – train vs oot";
       run;
+
    %end;
 
-   /* show final results */
    proc print data=&outbase._metrics noobs;
-      title "Model Performance Comparison";
       var model sample n_obs bias rmse mae correlation;
    run;
 
-   /* cleanup temp datasets */
    proc datasets lib=work nolist;
-      delete combined_data work_data pred_out nlmix_out current_: 
-             corr_out corr_values metrics_temp avg_temp plot_data vif_results;
-   quit;
-
+      delete _:; quit;
 %mend lgd_censored;
-
-
-%lgd_censored(
-   train=lgd_training_data,
-   oot=lgd_oot_data, 
-   depvar=lgd_36M,
-   indep=&all_vars,
-   datevar=def_date,
-   models=TOBIT CG BR,
-   outbase=lgd_results
-);
