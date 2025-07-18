@@ -13,9 +13,22 @@
 
    %let eps = 1e-6;     
 
-   /* count variables and clean up the list */
+   /* count variables and clean up the list - remove duplicates */
    %let var_count = %sysfunc(countw(&indep));
    %put Processing &var_count predictor variables;
+   
+   /* create clean variable list without duplicates */
+   %let clean_indep = ;
+   %do j = 1 %to &var_count;
+      %let thisvar = %scan(&indep,&j);
+      %if %index(&clean_indep,&thisvar) = 0 %then %do;
+         %let clean_indep = &clean_indep &thisvar;
+      %end;
+   %end;
+   %let clean_indep = %sysfunc(strip(&clean_indep));
+   %let var_count = %sysfunc(countw(&clean_indep));
+   %put Clean variable list: &clean_indep;
+   %put Final variable count: &var_count;
 
    /* basic data stacking and prep */
    data combined_data;
@@ -30,7 +43,7 @@
       if &depvar < 0 or &depvar > 1 then delete;
       
       /* check for missing predictors */
-      if nmiss(of &indep) > 0 then delete;
+      if nmiss(of &clean_indep) > 0 then delete;
    run;
 
    /* quick data summary */
@@ -44,7 +57,7 @@
 
    /* check multicollinearity with vif values - training data only */
    proc reg data=combined_data(where=(sample='TRAIN'));
-      model &depvar = &indep / vif;
+      model &depvar = &clean_indep / vif;
       ods output ParameterEstimates=vif_results;
    run;
    quit;
@@ -104,7 +117,7 @@
       %if &model = TOBIT %then %do;
          /* tobit model using proc qlim */
          proc qlim data=work_data;
-            model &depvar = &indep;
+            model &depvar = &clean_indep;
             endogenous &depvar ~ censored(lb=0 ub=1);
             output out=pred_out predicted marginal;
          run;
@@ -135,7 +148,7 @@
             /* build linear predictor */
             eta = beta0;
             %do j=1 %to &var_count;
-               %let thisvar = %scan(&indep,&j);
+               %let thisvar = %scan(&clean_indep,&j);
                eta = eta + b&j * &thisvar;
             %end;
             
@@ -179,7 +192,7 @@
             /* linear predictor */
             eta = beta0;
             %do j=1 %to &var_count;
-               %let thisvar = %scan(&indep,&j);
+               %let thisvar = %scan(&clean_indep,&j);
                eta = eta + b&j * &thisvar;
             %end;
             
@@ -206,7 +219,12 @@
          run;
       %end;
 
-      /* calculate correlation using proc corr instead of sql */
+      /* sort data for by processing */
+      proc sort data=current_pred;
+         by sample;
+      run;
+
+      /* calculate correlation using proc corr */
       proc corr data=current_pred noprint outp=corr_out;
          var &depvar pred_lgd;
          by sample;
@@ -220,11 +238,11 @@
          keep sample correlation;
       run;
 
-      /* calculate other metrics using proc means */
+      /* calculate other metrics using simple means */
       proc means data=current_pred noprint;
          class sample;
          var residual abs_residual;
-         output out=metrics_temp
+         output out=metrics_temp(where=(sample ne ''))
                 mean(residual)=bias 
                 std(residual)=rmse
                 mean(abs_residual)=mae
@@ -232,22 +250,29 @@
       run;
 
       /* combine metrics */
+      proc sort data=metrics_temp; by sample; run;
+      proc sort data=corr_values; by sample; run;
+      
       data current_metrics;
-         merge metrics_temp(where=(sample ne '') in=a) 
-               corr_values;
+         merge metrics_temp(in=a) corr_values;
          by sample;
          if a;
          length model $10;
          model = "&model";
+         if missing(correlation) then correlation = 0;
          format bias rmse mae correlation 8.4;
          keep model sample n_obs bias rmse mae correlation;
       run;
 
-      /* date level aggregation */
+      /* date level aggregation - sort first */
+      proc sort data=current_pred;
+         by &datevar sample;
+      run;
+      
       proc means data=current_pred noprint;
          class &datevar sample;
          var &depvar pred_lgd;
-         output out=avg_temp
+         output out=avg_temp(where=(&datevar ne . and sample ne ''))
                 mean(&depvar)=actual_lgd 
                 mean(pred_lgd)=pred_lgd
                 n=n_obs;
@@ -255,7 +280,6 @@
 
       data current_avg; 
          set avg_temp;
-         where &datevar ne . and sample ne '';
          length model $10;
          model = "&model"; 
          format actual_lgd pred_lgd 8.4;
