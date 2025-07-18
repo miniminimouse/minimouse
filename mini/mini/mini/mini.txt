@@ -368,38 +368,46 @@
       run;
 
       /* append results to final datasets */
+      %put NOTE: Appending &model results to final datasets;
+      
+      /* verify datasets before appending */
+      proc contents data=lgd_&model._predictions noprint out=pred_check; run;
+      proc contents data=lgd_&model._metrics_final noprint out=metrics_check; run;
+      proc contents data=lgd_&model._date_avg_final noprint out=avg_check; run;
+      
       proc append base=&outbase._pred data=lgd_&model._predictions force; run;
       proc append base=&outbase._metrics data=lgd_&model._metrics_final force; run;
       proc append base=&outbase._compare data=lgd_&model._date_avg_final force; run;
 
    %end;
 
-   /* create combined backtesting plot with reference line */
-   data lgd_plot_data;
-      set &outbase._compare;
-      
-      /* create separate series for actual and predicted by sample */
-      length series_name $50;
-      
-      /* actual values */
-      value = actual_lgd;
-      series_name = catx(' ', 'Actual', sample);
-      output;
-      
-      /* predicted values */
-      value = pred_lgd;
-      series_name = catx(' ', 'Predicted', sample);
-      output;
-      
-      keep &datevar value series_name model sample;
-   run;
-
-   /* create the combined plot for each model */
+   /* create the plots directly from each model's date_avg_final dataset */
    %do i = 1 %to &nmodels;
       %let model = %upcase(%scan(&models,&i));
       
+      /* create plot data for this specific model from its avg_final dataset */
+      data lgd_&model._plot_data;
+         set lgd_&model._date_avg_final;
+         
+         /* create separate series for actual and predicted by sample */
+         length series_name $50;
+         
+         /* actual values */
+         value = actual_lgd;
+         series_name = catx(' ', 'Actual', sample);
+         output;
+         
+         /* predicted values */
+         value = pred_lgd;
+         series_name = catx(' ', 'Predicted', sample);
+         output;
+         
+         keep &datevar value series_name model sample;
+      run;
+      
+      /* create plot for this model */
       ods graphics / reset width=12in height=8in;
-      proc sgplot data=lgd_plot_data(where=(model="&model"));
+      proc sgplot data=lgd_&model._plot_data;
          series x=&datevar y=value / group=series_name
                 lineattrs=(thickness=2)
                 markers markerattrs=(size=4);
@@ -417,6 +425,14 @@
       title "Model Performance Comparison";
       var model sample n_obs bias rmse mae correlation;
    run;
+   
+   /* verify DEF_DATE exists in compare dataset */
+   %put NOTE: Checking for &datevar in &outbase._compare dataset;
+   proc sql noprint;
+      select count(distinct &datevar) into :final_dates 
+      from &outbase._compare;
+   quit;
+   %put NOTE: Found &final_dates distinct dates in final compare dataset;
 
    /* NO CLEANUP - keeping all intermediate datasets for debugging */
    %put NOTE: All intermediate datasets have been retained for inspection;
@@ -425,13 +441,17 @@
    %put NOTE:   lgd_combined_raw - initial combined data;
    %put NOTE:   lgd_[MODEL]_work - working data for each model;
    %put NOTE:   lgd_[MODEL]_predictions - predictions with all variables;
+   %put NOTE:   lgd_[MODEL]_date_avg_final - date-level averages with DEF_DATE;
+   %put NOTE:   lgd_[MODEL]_plot_data - data used for plotting;
+   
+   /* verify final output datasets */
+   %put NOTE: Final output datasets created:;
+   %put NOTE:   &outbase._pred - all predictions;
+   %put NOTE:   &outbase._metrics - performance metrics;
+   %put NOTE:   &outbase._compare - date-level comparisons;
 
 %mend lgd_censored;
 
-/* usage example */
-%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
-                Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
-                PchgO_Unemp_15_Pls_Wk Lag6_PChg12_HPI_P_Only pre2007dummy;
 
 %lgd_censored(
    train=lgd_training_data,
