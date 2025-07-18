@@ -45,24 +45,42 @@
    /* check multicollinearity with vif values - training data only */
    proc reg data=_combined(where=(sample='TRAIN'));
       model &depvar = &indep / vif;
-      ods output ParameterEstimates=_vif_results;
+      ods output ParameterEstimates=vif_results;
    run;
    quit;
 
-   /* show vif results */
-   proc print data=_vif_results noobs;
-      title "VIF Analysis - Multicollinearity Check";
-      var Variable Estimate StdErr tValue Probt VarianceInflation;
-      where Variable ne 'Intercept';
-      format Estimate StdErr 8.4 tValue 8.2 Probt 8.4 VarianceInflation 8.2;
-   run;
+   /* show vif results if dataset exists */
+   %if %sysfunc(exist(vif_results)) %then %do;
+      proc print data=vif_results noobs;
+         title "VIF Analysis - Multicollinearity Check";
+         var Variable Estimate StdErr tValue Probt VarianceInflation;
+         where Variable ne 'Intercept';
+         format Estimate StdErr 8.4 tValue 8.2 Probt 8.4 VarianceInflation 8.2;
+      run;
 
-   /* flag high vif variables */
-   data _null_;
-      set _vif_results;
-      where Variable ne 'Intercept' and VarianceInflation > 5;
-      if _n_ = 1 then put "WARNING: Variables with VIF > 5 detected:";
-      put Variable "VIF=" VarianceInflation 8.2;
+      /* flag high vif variables */
+      data _null_;
+         set vif_results;
+         where Variable ne 'Intercept' and VarianceInflation > 5;
+         if _n_ = 1 then put "WARNING: Variables with VIF > 5 detected:";
+         put Variable "VIF=" VarianceInflation 8.2;
+      run;
+   %end;
+
+   /* initialize the final output datasets */
+   data &outbase._pred;
+      length sample $5 model $10;
+      delete;
+   run;
+   
+   data &outbase._metrics;
+      length model $10 sample $5;
+      delete;
+   run;
+   
+   data &outbase._compare;
+      length model $10;
+      delete;
    run;
 
    /* loop through each model */
@@ -72,7 +90,7 @@
       %put Running &model model...;
 
       /* prep data specific to each model */
-      data _work;
+      data work_data;
          set _combined;
          
          %if &model = BR %then %do;
@@ -84,31 +102,32 @@
 
       /* run the appropriate model */
       %if &model = TOBIT %then %do;
-         /* tobit model using proc qlim with proper syntax */
-         proc qlim data=_work;
+         /* tobit model using proc qlim */
+         proc qlim data=work_data;
             model &depvar = &indep;
             endogenous &depvar ~ censored(lb=0 ub=1);
-            output out=_pred_&model predicted marginal;
+            output out=pred_out predicted marginal;
          run;
          
-         /* fix output variable names from qlim */
-         data _pred_&model;
-            set _pred_&model;
+         /* create predictions dataset */
+         data pred_&model;
+            set pred_out;
+            model = "&model";
             pred_lgd = p_&depvar;
-            keep sample &datevar &depvar pred_lgd;
+            keep sample &datevar &depvar pred_lgd model;
          run;
       %end;
 
       %else %if &model = CG %then %do;
          /* censored gamma model */
-         proc nlmixed data=_work tech=newrap qpoints=1 maxiter=200;
+         proc nlmixed data=work_data tech=newrap qpoints=1 maxiter=200;
             parms beta0=0;
             %do j=1 %to &var_count;
                parms b&j=0;
             %end;
             parms logalpha=0;
 
-            /* build linear predictor step by step */
+            /* build linear predictor */
             eta = beta0;
             %do j=1 %to &var_count;
                %let thisvar = %scan(&indep,&j);
@@ -128,18 +147,19 @@
                ll = log(pdf('gamma', &depvar, alpha, scale));
 
             model &depvar ~ general(ll);
-            predict mu out=_pred_&model(rename=(pred=pred_lgd));
+            predict mu out=nlmix_out(rename=(pred=pred_lgd));
          run;
          
-         data _pred_&model;
-            set _pred_&model;
-            keep sample &datevar &depvar pred_lgd;
+         data pred_&model;
+            set nlmix_out;
+            model = "&model";
+            keep sample &datevar &depvar pred_lgd model;
          run;
       %end;
 
       %else %if &model = BR %then %do;
          /* beta regression model */
-         proc nlmixed data=_work tech=newrap qpoints=1 maxiter=200;
+         proc nlmixed data=work_data tech=newrap qpoints=1 maxiter=200;
             parms beta0=0;
             %do j=1 %to &var_count;
                parms b&j=0;
@@ -161,18 +181,19 @@
                  (mu*phi-1)*log(&depvar) + ((1-mu)*phi-1)*log(1-&depvar);
 
             model &depvar ~ general(ll);
-            predict mu out=_pred_&model(rename=(pred=pred_lgd));
+            predict mu out=nlmix_out(rename=(pred=pred_lgd));
          run;
          
-         data _pred_&model;
-            set _pred_&model;
-            keep sample &datevar &depvar pred_lgd;
+         data pred_&model;
+            set nlmix_out;
+            model = "&model";
+            keep sample &datevar &depvar pred_lgd model;
          run;
       %end;
 
-      /* clean up predictions and calculate residuals */
-      data _pred_&model;
-         set _pred_&model;
+      /* add residuals and bounds check */
+      data pred_&model;
+         set pred_&model;
          
          residual = &depvar - pred_lgd;
          abs_residual = abs(residual);
@@ -182,48 +203,57 @@
          if pred_lgd > 1 then pred_lgd = 1;
       run;
 
-      /* calculate performance metrics using sql instead of proc means */
-      proc sql;
-         create table _metrics_&model as
-         select 
-            "&model" as model,
-            sample,
-            count(*) as n_obs,
-            mean(residual) as bias format=8.4,
-            std(residual) as rmse format=8.4,
-            mean(abs_residual) as mae format=8.4,
-            corr(&depvar, pred_lgd) as correlation format=8.4
-         from _pred_&model
-         group by sample;
-      quit;
+      /* calculate metrics - simple approach */
+      proc means data=pred_&model noprint;
+         class sample;
+         var residual abs_residual;
+         output out=temp_metrics(where=(sample ne ''))
+                mean(residual)=bias 
+                std(residual)=rmse
+                mean(abs_residual)=mae
+                n=n_obs;
+      run;
+      
+      /* calculate correlation separately */
+      proc corr data=pred_&model noprint 
+                outp=temp_corr(where=(_type_='CORR' and _name_="&depvar"));
+         var &depvar pred_lgd;
+         by sample;
+      run;
 
-      /* aggregate by date for plotting */
-      proc sql;
-         create table _avg_&model as
-         select 
-            "&model" as model,
-            &datevar,
-            mean(&depvar) as actual_lgd format=8.4,
-            mean(pred_lgd) as pred_lgd format=8.4
-         from _pred_&model
-         where &datevar is not missing
-         group by &datevar;
-      quit;
+      /* combine metrics */
+      data metrics_&model;
+         merge temp_metrics(in=a) 
+               temp_corr(keep=sample pred_lgd rename=(pred_lgd=correlation));
+         by sample;
+         if a;
+         
+         model = "&model";
+         format bias rmse mae correlation 8.4;
+         keep model sample n_obs bias rmse mae correlation;
+      run;
 
-      /* append to final datasets */
-      %if &i = 1 %then %do;
-         data &outbase._pred; set _pred_&model; run;
-         data &outbase._metrics; set _metrics_&model; run; 
-         data &outbase._compare; set _avg_&model; run;
-      %end;
-      %else %do;
-         proc append base=&outbase._pred data=_pred_&model force; run;
-         proc append base=&outbase._metrics data=_metrics_&model force; run;
-         proc append base=&outbase._compare data=_avg_&model force; run;
-      %end;
+      /* date level aggregation */
+      proc means data=pred_&model noprint;
+         class &datevar;
+         var &depvar pred_lgd;
+         output out=temp_avg(where=(&datevar ne .))
+                mean=actual_lgd pred_lgd;
+      run;
 
-      /* make a simple plot */
-      proc sgplot data=_avg_&model;
+      data avg_&model; 
+         set temp_avg; 
+         model = "&model"; 
+         drop _type_ _freq_;
+      run;
+
+      /* append results */
+      proc append base=&outbase._pred data=pred_&model force; run;
+      proc append base=&outbase._metrics data=metrics_&model force; run;
+      proc append base=&outbase._compare data=avg_&model force; run;
+
+      /* simple plot */
+      proc sgplot data=avg_&model;
          series x=&datevar y=actual_lgd / lineattrs=(thickness=2) 
                 legendlabel="Actual";
          series x=&datevar y=pred_lgd / lineattrs=(thickness=2 pattern=dash) 
@@ -236,15 +266,16 @@
 
    %end;
 
-   /* show results */
+   /* show final results */
    proc print data=&outbase._metrics noobs;
       title "Model Performance Comparison";
       var model sample n_obs bias rmse mae correlation;
    run;
 
-   /* clean up workspace */
+   /* cleanup temp datasets */
    proc datasets lib=work nolist;
-      delete _combined _work _pred_: _metrics_: _avg_: _vif_results;
+      delete _combined work_data pred_out nlmix_out pred_: metrics_: avg_: 
+             temp_: vif_results;
    quit;
 
 %mend lgd_censored;
