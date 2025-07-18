@@ -1,108 +1,167 @@
-%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio Lag12_Unemp_SA
-PchgO_MA3_Home_Sales BAL_DEF_ADJ PchgO_Unemp_15_Pls_W
-Lag6_PChg12_HPI_P_On pre2007dummy;
+/*--------------------------------------------------------------*/
+/* lgd_model.sas  –  one-stop macro for cg / br lgd estimation  */
+/*--------------------------------------------------------------*/
+%macro lgd_model(
+      data=,
+      flagvar=,
+      trainval=TRAIN,
+      ootval=OOT,
+      depvar=,
+      indep=,
+      models=CG BR,
+      outbase=lgd_out
+   );
 
-data train_data;
-    set lgd_stage_all_wf;
-    model_lgd = lgd_36m;
-run;
+   /* tiny helper to nudge exact 0/1 values for beta regression */
+   %let eps=1e-6;
 
-data score_oot;
-    set oot_final_data;
-    model_lgd = .;
-run;
+   /* loop over requested model list */
+   %let nmodels=%sysfunc(countw(&models));
+   %do i=1 %to &nmodels;
+      %let thismodel=%upcase(%scan(&models,&i));
 
-data combined;
-    set train_data (in=intrain) score_oot (in=inoot);
-    if intrain then flag = 'TRAIN';
-    else flag = 'OOT';
-run;
+      %put NOTE: running &thismodel.;
 
-proc qlim data=combined;
-    model model_lgd = &all_vars;
-    endogenous model_lgd ~ censored(lb=0 ub=1);
-    output out=tobit_results predicted marginal;
-run;
+      /*-----------------------------------------------------------*/
+      /* build dataset specific to this model                      */
+      /*-----------------------------------------------------------*/
+      data _work_in;
+         set &data;
+         model = "&thismodel";
+         /* for beta regression we jitter 0/1 by eps */
+         %if &thismodel = BR %then %do;
+            if &depvar = 0 then &depvar = &eps;
+            else if &depvar = 1 then &depvar = 1-&eps;
+         %end;
+      run;
 
-proc lifereg data=combined;
-    model model_lgd = &all_vars / distribution=normal;
-    output out=lifereg_results predicted=pred_lgd;
-run;
+      /*-----------------------------------------------------------*/
+      /* censored gamma via nlmixed                                */
+      /*-----------------------------------------------------------*/
+      %if &thismodel = CG %then %do;
+         proc nlmixed data=_work_in qpoints=1 tech=newrap maxiter=500;
+            parms beta0=0 / hold=beta0;
+            /* add one beta per predictor */
+            %local j var;
+            %let j=1;
+            %do %while (%scan(&indep,&j) ne );
+               %let var=%scan(&indep,&j);
+               parms b&j.=0;
+               %let j=%eval(&j+1);
+            %end;
+            parms logalpha=0;            /* shape param (alpha) > 0 */
 
-proc means data=tobit_results (where=(flag='TRAIN'));
-    var lgd_36m P_model_lgd M_model_lgd;
-run;
+            /* linear predictor and mean */
+            eta  = beta0
+            %let j=1;
+            %do %while (%scan(&indep,&j) ne );
+               %let var=%scan(&indep,&j);
+               + b&j.*&&var
+               %let j=%eval(&j+1);
+            %end;
+            ;
+            mu   = exp(eta);             /* mean > 0 */
+            alpha= exp(logalpha);        /* shape > 0 */
+            scale= mu / alpha;
 
-proc sgplot data=tobit_results (where=(flag='TRAIN'));
-    scatter x=lgd_36m y=P_model_lgd;
-    refline 0 / axis=x;
-    refline 0 / axis=y;
-    lineparm x=0 y=0 slope=1 / lineattrs=(color=gray pattern=dash);
-run;
+            /* censored gamma log-likelihood */
+            if      &depvar <  &eps then
+               ll = log( gamcdf(&eps ,alpha,scale) );
+            else if &depvar > 1-&eps then
+               ll = log( 1 - gamcdf(1-&eps ,alpha,scale) );
+            else
+               ll = log( gampdf(&depvar ,alpha,scale) );
 
-data residuals_train;
-    set tobit_results (where=(flag='TRAIN'));
-    residual = lgd_36m - P_model_lgd;
-    abs_residual = abs(residual);
-run;
+            model &depvar ~ general(ll);
+            predict mu                      out=_pred_&thismodel(rename=(pred=pred_lgd));
+         run;
+      %end;
 
-proc sgplot data=residuals_train;
-    scatter x=P_model_lgd y=residual;
-    refline 0 / axis=y;
-run;
+      /*-----------------------------------------------------------*/
+      /* beta regression via nlmixed                               */
+      /*-----------------------------------------------------------*/
+      %else %if &thismodel = BR %then %do;
+         proc nlmixed data=_work_in qpoints=1 tech=newrap maxiter=500;
+            parms beta0=0;
+            %local j var;
+            %let j=1;
+            %do %while (%scan(&indep,&j) ne );
+               %let var=%scan(&indep,&j);
+               parms b&j.=0;
+               %let j=%eval(&j+1);
+            %end;
+            parms logphi=0;              /* precision > 0 */
 
-proc sql;
-    create table metrics_train as
-    select
-        mean(residual) as mean_residual,
-        std(residual) as std_residual,
-        mean(abs_residual) as mae,
-        sqrt(mean(residual**2)) as rmse
-    from residuals_train;
-quit;
+            eta  = beta0
+            %let j=1;
+            %do %while (%scan(&indep,&j) ne );
+               %let var=%scan(&indep,&j);
+               + b&j.*&&var
+               %let j=%eval(&j+1);
+            %end;
+            ;
+            mu  = 1 / (1 + exp(-eta));
+            phi = exp(logphi);
 
-proc print data=metrics_train;
-run;
+            ll  = lgamma(phi) - lgamma(mu*phi) - lgamma((1-mu)*phi)
+                  + (mu*phi-1)*log(&depvar) + ((1-mu)*phi-1)*log(1-&depvar);
 
-proc means data=tobit_results (where=(flag='OOT'));
-    var lgd_36m P_model_lgd M_model_lgd;
-run;
+            model &depvar ~ general(ll);
+            predict mu                      out=_pred_&thismodel(rename=(pred=pred_lgd));
+         run;
+      %end;
 
-proc sgplot data=tobit_results (where=(flag='OOT'));
-    scatter x=lgd_36m y=P_model_lgd;
-    refline 0 / axis=x;
-    refline 0 / axis=y;
-    lineparm x=0 y=0 slope=1 / lineattrs=(color=gray pattern=dash);
-run;
+      /*-----------------------------------------------------------*/
+      /* compute residuals and summary metrics                     */
+      /*-----------------------------------------------------------*/
+      data _pred_&thismodel;
+         set _pred_&thismodel;
+         keep &flagvar model &depvar pred_lgd;
+         residual     = &depvar - pred_lgd;
+         abs_residual = abs(residual);
+      run;
 
-data residuals_oot;
-    set tobit_results (where=(flag='OOT'));
-    residual = lgd_36m - P_model_lgd;
-    abs_residual = abs(residual);
-run;
+      proc sql noprint;
+         create table _metrics_&thismodel as
+         select
+            "&thismodel"                as model,
+            &flagvar                    as sample,
+            mean(residual)              as mean_residual   format=8.4,
+            std(residual)               as std_residual    format=8.4,
+            mean(abs_residual)          as mae             format=8.4,
+            sqrt(mean(residual**2))     as rmse            format=8.4
+         from _pred_&thismodel
+         group by &flagvar;
+      quit;
 
-proc sgplot data=residuals_oot;
-    scatter x=P_model_lgd y=residual;
-    refline 0 / axis=y;
-run;
+      /* stack results for all models */
+      %if &i=1 %then %do;
+         data &outbase._pred;    set _pred_&thismodel;    run;
+         data &outbase._metrics; set _metrics_&thismodel; run;
+      %end;
+      %else %do;
+         proc append base=&outbase._pred    data=_pred_&thismodel   force; run;
+         proc append base=&outbase._metrics data=_metrics_&thismodel force; run;
+      %end;
 
-proc sql;
-    create table metrics_oot as
-    select
-        mean(residual) as mean_residual,
-        std(residual) as std_residual,
-        mean(abs_residual) as mae,
-        sqrt(mean(residual**2)) as rmse
-    from residuals_oot;
-quit;
+   %end;  /* model loop */
 
-proc print data=metrics_oot;
-run;
+%mend lgd_model;
 
-proc reg data=train_data;
-    model lgd_36m = &all_vars / selection=stepwise slentry=0.05 slstay=0.05;
-run;
+/*--------------------------------------------------------------*/
+/* example call                                                 */
+/*--------------------------------------------------------------*/
+%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
+                Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
+                PchgO_Unemp_15_Pls_W Lag6_PChg12_HPI_P_On pre2007dummy;
 
-proc corr data=train_data;
-    var &all_vars;
-run;
+%lgd_model(
+   data=combined,
+   flagvar=flag,
+   trainval=TRAIN,
+   ootval=OOT,
+   depvar=model_lgd,
+   indep=&all_vars,
+   models=CG BR,
+   outbase=lgd_run1
+);
