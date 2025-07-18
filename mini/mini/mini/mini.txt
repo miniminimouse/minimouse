@@ -366,10 +366,6 @@
 
 %mend lgd_censored;
 
-/* usage example */
-%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
-                Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
-                PchgO_Unemp_15_Pls_Wk Lag6_PChg12_HPI_P_Only pre2007dummy;
 
 %lgd_censored(
    train=lgd_training_data,
