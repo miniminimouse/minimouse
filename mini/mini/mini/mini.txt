@@ -1,103 +1,91 @@
-/*--------------------------------------------------------------*/
-/* lgd_model.sas  –  one-stop macro for cg / br lgd estimation  */
-/*--------------------------------------------------------------*/
-%macro lgd_model(
-      data=,
-      flagvar=,
-      trainval=TRAIN,
-      ootval=OOT,
-      depvar=,
-      indep=,
-      models=CG BR,
-      outbase=lgd_out
+/*---------------------------------------------------------------*/
+/* lgd_model2.sas – censored-gamma / beta regression macro       */
+/*---------------------------------------------------------------*/
+%macro lgd_model2(
+      train=,          /* training dataset                         */
+      oot=,            /* out-of-time dataset                      */
+      depvar=,         /* target lgd variable                      */
+      indep=,          /* predictor list (space separated)         */
+      models=CG BR,    /* which engines: CG, BR, or both           */
+      outbase=lgd_out  /* stem for output tables                   */
    );
 
-   /* tiny helper to nudge exact 0/1 values for beta regression */
-   %let eps=1e-6;
+   %let eps = 1e-6;    /* small jitter for beta regression         */
 
-   /* loop over requested model list */
-   %let nmodels=%sysfunc(countw(&models));
-   %do i=1 %to &nmodels;
-      %let thismodel=%upcase(%scan(&models,&i));
+   /* 1. stack the two samples and mark them                       */
+   data _cmb;
+      set &train(in=intrain) &oot(in=inoot);
+      length sample $5;
+      if intrain then sample = 'TRAIN';
+      else if inoot then sample = 'OOT';
+   run;
 
+   /* loop over requested model list                               */
+   %let nmodels = %sysfunc(countw(&models));
+   %do i = 1 %to &nmodels;
+      %let thismodel = %upcase(%scan(&models,&i));
       %put NOTE: running &thismodel.;
 
-      /*-----------------------------------------------------------*/
-      /* build dataset specific to this model                      */
-      /*-----------------------------------------------------------*/
+      /* 1a. prep jitter for beta regression                        */
       data _work_in;
-         set &data;
+         set _cmb;
          model = "&thismodel";
-         /* for beta regression we jitter 0/1 by eps */
          %if &thismodel = BR %then %do;
             if &depvar = 0 then &depvar = &eps;
             else if &depvar = 1 then &depvar = 1-&eps;
          %end;
       run;
 
-      /*-----------------------------------------------------------*/
-      /* censored gamma via nlmixed                                */
-      /*-----------------------------------------------------------*/
+      /* 2. censored gamma                                          */
       %if &thismodel = CG %then %do;
-         proc nlmixed data=_work_in qpoints=1 tech=newrap maxiter=500;
-            parms beta0=0 / hold=beta0;
-            /* add one beta per predictor */
-            %local j var;
+         proc nlmixed data=_work_in tech=newrap qpoints=1 maxiter=500;
+            /* params */
+            parms beta0=0;
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
-               %let var=%scan(&indep,&j);
                parms b&j.=0;
-               %let j=%eval(&j+1);
+               %let j = %eval(&j+1);
             %end;
-            parms logalpha=0;            /* shape param (alpha) > 0 */
+            parms logalpha=0;
 
-            /* linear predictor and mean */
-            eta  = beta0
+            /* linear predictor */
+            eta = beta0
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
-               %let var=%scan(&indep,&j);
-               + b&j.*&&var
-               %let j=%eval(&j+1);
+               + b&j.*%scan(&indep,&j)
+               %let j = %eval(&j+1);
             %end;
             ;
-            mu   = exp(eta);             /* mean > 0 */
-            alpha= exp(logalpha);        /* shape > 0 */
-            scale= mu / alpha;
+            mu    = exp(eta);
+            alpha = exp(logalpha);
+            scale = mu / alpha;
 
-            /* censored gamma log-likelihood */
-            if      &depvar <  &eps then
-               ll = log( gamcdf(&eps ,alpha,scale) );
-            else if &depvar > 1-&eps then
-               ll = log( 1 - gamcdf(1-&eps ,alpha,scale) );
-            else
-               ll = log( gampdf(&depvar ,alpha,scale) );
+            /* censored gamma ll */
+            if      &depvar <  &eps then ll = log(gamcdf(&eps ,alpha,scale));
+            else if &depvar > 1-&eps then ll = log(1 - gamcdf(1-&eps ,alpha,scale));
+            else ll = log(gampdf(&depvar ,alpha,scale));
 
             model &depvar ~ general(ll);
-            predict mu                      out=_pred_&thismodel(rename=(pred=pred_lgd));
+            predict mu out=_pred_&thismodel(rename=(pred=pred_lgd));
          run;
       %end;
 
-      /*-----------------------------------------------------------*/
-      /* beta regression via nlmixed                               */
-      /*-----------------------------------------------------------*/
+      /* 3. beta regression                                         */
       %else %if &thismodel = BR %then %do;
-         proc nlmixed data=_work_in qpoints=1 tech=newrap maxiter=500;
+         proc nlmixed data=_work_in tech=newrap qpoints=1 maxiter=500;
             parms beta0=0;
-            %local j var;
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
-               %let var=%scan(&indep,&j);
                parms b&j.=0;
-               %let j=%eval(&j+1);
+               %let j = %eval(&j+1);
             %end;
-            parms logphi=0;              /* precision > 0 */
+            parms logphi=0;
 
-            eta  = beta0
+            eta = beta0
             %let j=1;
             %do %while (%scan(&indep,&j) ne );
-               %let var=%scan(&indep,&j);
-               + b&j.*&&var
-               %let j=%eval(&j+1);
+               + b&j.*%scan(&indep,&j)
+               %let j = %eval(&j+1);
             %end;
             ;
             mu  = 1 / (1 + exp(-eta));
@@ -107,16 +95,14 @@
                   + (mu*phi-1)*log(&depvar) + ((1-mu)*phi-1)*log(1-&depvar);
 
             model &depvar ~ general(ll);
-            predict mu                      out=_pred_&thismodel(rename=(pred=pred_lgd));
+            predict mu out=_pred_&thismodel(rename=(pred=pred_lgd));
          run;
       %end;
 
-      /*-----------------------------------------------------------*/
-      /* compute residuals and summary metrics                     */
-      /*-----------------------------------------------------------*/
+      /* 4. residuals and metrics                                   */
       data _pred_&thismodel;
          set _pred_&thismodel;
-         keep &flagvar model &depvar pred_lgd;
+         keep sample model &depvar pred_lgd;
          residual     = &depvar - pred_lgd;
          abs_residual = abs(residual);
       run;
@@ -124,18 +110,18 @@
       proc sql noprint;
          create table _metrics_&thismodel as
          select
-            "&thismodel"                as model,
-            &flagvar                    as sample,
-            mean(residual)              as mean_residual   format=8.4,
-            std(residual)               as std_residual    format=8.4,
-            mean(abs_residual)          as mae             format=8.4,
-            sqrt(mean(residual**2))     as rmse            format=8.4
+            "&thismodel"               as model,
+            sample,
+            mean(residual)             as mean_residual format=8.4,
+            std(residual)              as std_residual  format=8.4,
+            mean(abs_residual)         as mae           format=8.4,
+            sqrt(mean(residual**2))    as rmse          format=8.4
          from _pred_&thismodel
-         group by &flagvar;
+         group by sample;
       quit;
 
-      /* stack results for all models */
-      %if &i=1 %then %do;
+      /* 5. stack results                                            */
+      %if &i = 1 %then %do;
          data &outbase._pred;    set _pred_&thismodel;    run;
          data &outbase._metrics; set _metrics_&thismodel; run;
       %end;
@@ -144,24 +130,22 @@
          proc append base=&outbase._metrics data=_metrics_&thismodel force; run;
       %end;
 
-   %end;  /* model loop */
+   %end; /* model loop */
 
-%mend lgd_model;
+%mend lgd_model2;
 
-/*--------------------------------------------------------------*/
-/* example call                                                 */
-/*--------------------------------------------------------------*/
+/*---------------------------------------------------------------*/
+/* example call                                                  */
+/*---------------------------------------------------------------*/
 %let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
                 Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
                 PchgO_Unemp_15_Pls_W Lag6_PChg12_HPI_P_On pre2007dummy;
 
-%lgd_model(
-   data=combined,
-   flagvar=flag,
-   trainval=TRAIN,
-   ootval=OOT,
+%lgd_model2(
+   train=train_data,
+   oot=score_oot,
    depvar=model_lgd,
    indep=&all_vars,
    models=CG BR,
-   outbase=lgd_run1
+   outbase=lgd_run2
 );
