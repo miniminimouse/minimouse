@@ -203,67 +203,76 @@
          if pred_lgd > 1 then pred_lgd = 1;
       run;
 
-      /* calculate metrics - simple approach */
-      proc means data=pred_&model noprint;
-         class sample;
-         var residual abs_residual;
-         output out=temp_metrics(where=(sample ne ''))
-                mean(residual)=bias 
-                std(residual)=rmse
-                mean(abs_residual)=mae
-                n=n_obs;
-      run;
-      
-      /* calculate correlation separately */
-      proc corr data=pred_&model noprint 
-                outp=temp_corr(where=(_type_='CORR' and _name_="&depvar"));
-         var &depvar pred_lgd;
-         by sample;
-      run;
+      /* calculate metrics using sql to avoid variable issues */
+      proc sql;
+         create table metrics_&model as
+         select 
+            "&model" as model,
+            sample,
+            count(*) as n_obs,
+            mean(residual) as bias format=8.4,
+            std(residual) as rmse format=8.4,
+            mean(abs_residual) as mae format=8.4,
+            corr(&depvar, pred_lgd) as correlation format=8.4
+         from pred_&model
+         group by sample;
+      quit;
 
-      /* combine metrics */
-      data metrics_&model;
-         merge temp_metrics(in=a) 
-               temp_corr(keep=sample pred_lgd rename=(pred_lgd=correlation));
-         by sample;
-         if a;
-         
-         model = "&model";
-         format bias rmse mae correlation 8.4;
-         keep model sample n_obs bias rmse mae correlation;
-      run;
+      /* date level aggregation with sample info */
+      proc sql;
+         create table avg_&model as
+         select 
+            "&model" as model,
+            &datevar,
+            sample,
+            mean(&depvar) as actual_lgd format=8.4,
+            mean(pred_lgd) as pred_lgd format=8.4,
+            count(*) as n_obs
+         from pred_&model
+         where &datevar is not missing
+         group by &datevar, sample;
+      quit;
 
-      /* date level aggregation */
-      proc means data=pred_&model noprint;
-         class &datevar;
-         var &depvar pred_lgd;
-         output out=temp_avg(where=(&datevar ne .))
-                mean=actual_lgd pred_lgd;
-      run;
-
-      data avg_&model; 
-         set temp_avg; 
-         model = "&model"; 
-         drop _type_ _freq_;
-      run;
-
-      /* append results */
       proc append base=&outbase._pred data=pred_&model force; run;
       proc append base=&outbase._metrics data=metrics_&model force; run;
       proc append base=&outbase._compare data=avg_&model force; run;
 
-      /* simple plot */
-      proc sgplot data=avg_&model;
-         series x=&datevar y=actual_lgd / lineattrs=(thickness=2) 
-                legendlabel="Actual";
-         series x=&datevar y=pred_lgd / lineattrs=(thickness=2 pattern=dash) 
-                legendlabel="Predicted"; 
-         xaxis label="Date";
-         yaxis label="LGD Level";
-         title "&model Model - Backtesting Chart";
-         keylegend / location=inside position=topright;
-      run;
+   %end;
 
+   /* create combined backtesting plot like your example */
+   /* first reshape the data for plotting */
+   data plot_data;
+      set &outbase._compare;
+      
+      /* create separate series for actual and predicted by sample */
+      length series_name $50;
+      
+      /* actual values */
+      value = actual_lgd;
+      series_name = catx(' ', 'Actual', sample);
+      output;
+      
+      /* predicted values */
+      value = pred_lgd;
+      series_name = catx(' ', 'Predicted', sample);
+      output;
+      
+      keep &datevar value series_name model sample;
+   run;
+
+   /* create the combined plot for each model */
+   %do i = 1 %to &nmodels;
+      %let model = %upcase(%scan(&models,&i));
+      
+      proc sgplot data=plot_data(where=(model="&model"));
+         series x=&datevar y=value / group=series_name
+                lineattrs=(thickness=2)
+                markers markerattrs=(size=4);
+         xaxis label="Default Date" valueattrs=(size=10pt);
+         yaxis label="LGD Level" valueattrs=(size=10pt) min=0 max=1;
+         keylegend / position=topright across=1;
+         title "&model Model - Train vs OOT Performance" height=14pt;
+      run;
    %end;
 
    /* show final results */
@@ -275,7 +284,7 @@
    /* cleanup temp datasets */
    proc datasets lib=work nolist;
       delete _combined work_data pred_out nlmix_out pred_: metrics_: avg_: 
-             temp_: vif_results;
+             plot_data vif_results;
    quit;
 
 %mend lgd_censored;
