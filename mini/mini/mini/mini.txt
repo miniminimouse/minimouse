@@ -15,7 +15,9 @@
 
    /* count variables and clean up the list - remove duplicates */
    %let var_count = %sysfunc(countw(&indep));
-   %put Processing &var_count predictor variables;
+   %put NOTE: Processing &var_count predictor variables;
+   %put NOTE: Date variable is &datevar;
+   %put NOTE: Dependent variable is &depvar;
    
    /* create clean variable list without duplicates */
    %let clean_indep = ;
@@ -27,8 +29,8 @@
    %end;
    %let clean_indep = %sysfunc(strip(&clean_indep));
    %let var_count = %sysfunc(countw(&clean_indep));
-   %put Clean variable list: &clean_indep;
-   %put Final variable count: &var_count;
+   %put NOTE: Clean variable list: &clean_indep;
+   %put NOTE: Final variable count: &var_count;
 
    /* basic data stacking and prep */
    data lgd_combined_raw;
@@ -47,6 +49,22 @@
       
       /* check for missing predictors */
       if nmiss(of &clean_indep) > 0 then delete;
+      
+      /* explicitly check that date variable exists */
+      if missing(&datevar) then do;
+         put "WARNING: Missing &datevar for obs_id=" obs_id;
+      end;
+   run;
+
+   /* verify def_date exists in the combined data */
+   proc contents data=lgd_combined_raw noprint out=contents_check;
+   run;
+   
+   data _null_;
+      set contents_check;
+      if upcase(name) = upcase("&datevar") then do;
+         put "NOTE: &datevar found in combined dataset with type=" type "format=" format;
+      end;
    run;
 
    /* quick data summary */
@@ -54,9 +72,11 @@
       select count(*) into :total_obs from lgd_combined_raw;
       select count(*) into :train_obs from lgd_combined_raw where sample='TRAIN';
       select count(*) into :oot_obs from lgd_combined_raw where sample='OOT';
+      select count(distinct &datevar) into :n_dates from lgd_combined_raw;
    quit;
 
-   %put Dataset summary - Total: &total_obs, Train: &train_obs, OOT: &oot_obs;
+   %put NOTE: Dataset summary - Total: &total_obs, Train: &train_obs, OOT: &oot_obs;
+   %put NOTE: Number of distinct &datevar values: &n_dates;
 
    /* check multicollinearity with vif values - training data only */
    proc reg data=lgd_combined_raw(where=(sample='TRAIN')) outest=reg_estimates;
@@ -103,11 +123,11 @@
    %let nmodels = %sysfunc(countw(&models));
    %do i = 1 %to &nmodels;
       %let model = %upcase(%scan(&models,&i));
-      %put Running &model model...;
+      %put NOTE: Running &model model...;
 
-      /* prep data specific to each model */
+      /* prep data specific to each model - KEEP ALL VARIABLES */
       data lgd_&model._work;
-         set lgd_combined_raw;
+         set lgd_combined_raw;  /* this brings in ALL variables including def_date */
          
          /* store original lgd value before any transformation */
          original_lgd = &depvar;
@@ -119,6 +139,14 @@
          %end;
       run;
 
+      /* verify date variable still exists */
+      %put NOTE: Checking &datevar in lgd_&model._work dataset;
+      proc sql noprint;
+         select count(distinct &datevar) into :check_dates 
+         from lgd_&model._work;
+      quit;
+      %put NOTE: Found &check_dates distinct dates in lgd_&model._work;
+
       /* run the appropriate model */
       %if &model = TOBIT %then %do;
          /* tobit model using proc qlim */
@@ -128,14 +156,16 @@
             output out=lgd_&model._raw_pred predicted marginal;
          run;
          
-         /* merge predictions with original data to ensure all variables are retained */
+         /* merge predictions - KEEP ALL ORIGINAL VARIABLES */
          proc sort data=lgd_&model._work; by obs_id; run;
          proc sort data=lgd_&model._raw_pred; by obs_id; run;
          
          data lgd_&model._predictions;
-            merge lgd_&model._work(keep=obs_id sample &datevar original_lgd)
+            merge lgd_&model._work(in=a)  /* brings ALL variables */
                   lgd_&model._raw_pred(keep=obs_id p_&depvar);
             by obs_id;
+            if a;  /* only keep observations from original data */
+            
             length model $10;
             model = "&model";
             pred_lgd = p_&depvar;
@@ -144,6 +174,9 @@
             abs_residual = abs(residual);
             if pred_lgd < 0 then pred_lgd = 0;
             if pred_lgd > 1 then pred_lgd = 1;
+            
+            /* explicitly keep key variables plus all others */
+            /* not using keep statement so ALL variables are retained */
          run;
       %end;
 
@@ -179,14 +212,16 @@
             predict mu out=lgd_&model._nlmix_pred(rename=(pred=pred_lgd));
          run;
          
-         /* merge predictions back with original data */
+         /* merge predictions - KEEP ALL VARIABLES */
          proc sort data=lgd_&model._work; by obs_id; run;
          proc sort data=lgd_&model._nlmix_pred; by obs_id; run;
          
          data lgd_&model._predictions;
-            merge lgd_&model._work(keep=obs_id sample &datevar original_lgd) 
+            merge lgd_&model._work(in=a)  /* brings ALL variables */
                   lgd_&model._nlmix_pred(keep=obs_id pred_lgd);
             by obs_id;
+            if a;
+            
             length model $10;
             model = "&model";
             &depvar = original_lgd;  /* restore original value */
@@ -224,14 +259,16 @@
             predict mu out=lgd_&model._nlmix_out(rename=(pred=pred_lgd));
          run;
          
-         /* merge predictions with original data */
+         /* merge predictions - KEEP ALL VARIABLES */
          proc sort data=lgd_&model._work; by obs_id; run;
          proc sort data=lgd_&model._nlmix_out; by obs_id; run;
          
          data lgd_&model._predictions;
-            merge lgd_&model._work(keep=obs_id sample &datevar original_lgd)
+            merge lgd_&model._work(in=a)  /* brings ALL variables */
                   lgd_&model._nlmix_out(keep=obs_id pred_lgd);
             by obs_id;
+            if a;
+            
             length model $10;
             model = "&model";
             &depvar = original_lgd;  /* use original untransformed value */
@@ -241,6 +278,14 @@
             if pred_lgd > 1 then pred_lgd = 1;
          run;
       %end;
+
+      /* verify def_date exists in predictions */
+      %put NOTE: Verifying &datevar in lgd_&model._predictions;
+      proc sql noprint;
+         select count(*), count(distinct &datevar) into :n_pred, :n_dates_pred
+         from lgd_&model._predictions;
+      quit;
+      %put NOTE: lgd_&model._predictions has &n_pred rows and &n_dates_pred distinct dates;
 
       /* sort data for by processing */
       proc sort data=lgd_&model._predictions;
@@ -287,7 +332,20 @@
          keep model sample n_obs bias rmse mae correlation;
       run;
 
-      /* date level aggregation */
+      /* date level aggregation - THIS IS WHERE def_date IS CRITICAL */
+      %put NOTE: Creating date-level aggregation using &datevar;
+      
+      /* first verify the variable exists */
+      proc contents data=lgd_&model._predictions noprint out=pred_contents;
+      run;
+      
+      data _null_;
+         set pred_contents;
+         if upcase(name) = upcase("&datevar") then do;
+            put "NOTE: Found &datevar in predictions with type=" type;
+         end;
+      run;
+      
       proc sort data=lgd_&model._predictions;
          by &datevar sample;
       run;
@@ -363,9 +421,17 @@
    /* NO CLEANUP - keeping all intermediate datasets for debugging */
    %put NOTE: All intermediate datasets have been retained for inspection;
    %put NOTE: Dataset naming convention: lgd_[MODEL]_[purpose];
+   %put NOTE: Key datasets to check:;
+   %put NOTE:   lgd_combined_raw - initial combined data;
+   %put NOTE:   lgd_[MODEL]_work - working data for each model;
+   %put NOTE:   lgd_[MODEL]_predictions - predictions with all variables;
 
 %mend lgd_censored;
 
+/* usage example */
+%let all_vars = REFR_LTV SATO_INT LOAN_PURP_REFINANCE MOB_Term_Ratio
+                Lag12_Unemp_SA PchgO_MA3_Home_Sales BAL_DEF_ADJ
+                PchgO_Unemp_15_Pls_Wk Lag6_PChg12_HPI_P_Only pre2007dummy;
 
 %lgd_censored(
    train=lgd_training_data,
