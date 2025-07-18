@@ -42,26 +42,27 @@
 
    %put Dataset summary - Total: &total_obs, Train: &train_obs, OOT: &oot_obs;
 
-   /* check multicollinearity with vif values */
-   proc reg data=_combined;
+   /* check multicollinearity with vif values - training data only */
+   proc reg data=_combined(where=(sample='TRAIN'));
       model &depvar = &indep / vif;
-      ods output ParameterEstimates=_vif_output;
+      ods output ParameterEstimates=_vif_results;
    run;
    quit;
 
    /* show vif results */
-   proc print data=_vif_output noobs;
+   proc print data=_vif_results noobs;
       title "VIF Analysis - Multicollinearity Check";
       var Variable Estimate StdErr tValue Probt VarianceInflation;
       where Variable ne 'Intercept';
+      format Estimate StdErr 8.4 tValue 8.2 Probt 8.4 VarianceInflation 8.2;
    run;
 
    /* flag high vif variables */
-   data _high_vif;
-      set _vif_output;
+   data _null_;
+      set _vif_results;
       where Variable ne 'Intercept' and VarianceInflation > 5;
       if _n_ = 1 then put "WARNING: Variables with VIF > 5 detected:";
-      put Variable "VIF=" VarianceInflation;
+      put Variable "VIF=" VarianceInflation 8.2;
    run;
 
    /* loop through each model */
@@ -73,7 +74,6 @@
       /* prep data specific to each model */
       data _work;
          set _combined;
-         model_type = "&model";
          
          %if &model = BR %then %do;
             /* beta regression needs open interval (0,1) */
@@ -95,7 +95,7 @@
          data _pred_&model;
             set _pred_&model;
             pred_lgd = p_&depvar;
-            drop p_&depvar;
+            keep sample &datevar &depvar pred_lgd;
          run;
       %end;
 
@@ -130,6 +130,11 @@
             model &depvar ~ general(ll);
             predict mu out=_pred_&model(rename=(pred=pred_lgd));
          run;
+         
+         data _pred_&model;
+            set _pred_&model;
+            keep sample &datevar &depvar pred_lgd;
+         run;
       %end;
 
       %else %if &model = BR %then %do;
@@ -158,14 +163,16 @@
             model &depvar ~ general(ll);
             predict mu out=_pred_&model(rename=(pred=pred_lgd));
          run;
+         
+         data _pred_&model;
+            set _pred_&model;
+            keep sample &datevar &depvar pred_lgd;
+         run;
       %end;
 
       /* clean up predictions and calculate residuals */
       data _pred_&model;
          set _pred_&model;
-         
-         /* keep the important stuff */
-         keep sample model_type &datevar &depvar pred_lgd;
          
          residual = &depvar - pred_lgd;
          abs_residual = abs(residual);
@@ -175,49 +182,33 @@
          if pred_lgd > 1 then pred_lgd = 1;
       run;
 
-      /* calculate performance metrics */
-      proc means data=_pred_&model noprint;
-         class sample;
-         var residual abs_residual &depvar pred_lgd;
-         output out=_metrics_&model(where=(sample ne ''))
-                mean(residual)=bias 
-                std(residual)=rmse
-                mean(abs_residual)=mae
-                n=n_obs;
-      run;
-
-      /* add correlation separately since proc means doesn't do it */
-      proc corr data=_pred_&model noprint 
-                outp=_corr_&model(where=(_type_='CORR' and _name_="&depvar"));
-         var &depvar pred_lgd;
-         by sample;
-      run;
-
-      /* merge metrics with correlation */
-      data _metrics_&model;
-         merge _metrics_&model(in=a) 
-               _corr_&model(keep=sample pred_lgd rename=(pred_lgd=correlation));
-         by sample;
-         if a;
-         
-         model = "&model";
-         format bias rmse mae correlation 8.4;
-         keep model sample n_obs bias rmse mae correlation;
-      run;
+      /* calculate performance metrics using sql instead of proc means */
+      proc sql;
+         create table _metrics_&model as
+         select 
+            "&model" as model,
+            sample,
+            count(*) as n_obs,
+            mean(residual) as bias format=8.4,
+            std(residual) as rmse format=8.4,
+            mean(abs_residual) as mae format=8.4,
+            corr(&depvar, pred_lgd) as correlation format=8.4
+         from _pred_&model
+         group by sample;
+      quit;
 
       /* aggregate by date for plotting */
-      proc means data=_pred_&model noprint;
-         class &datevar;
-         var &depvar pred_lgd;
-         output out=_avg_&model(where=(&datevar ne .))
-                mean=actual_lgd pred_lgd;
-      run;
-
-      data _avg_&model; 
-         set _avg_&model; 
-         model = "&model"; 
-         drop _type_ _freq_;
-      run;
+      proc sql;
+         create table _avg_&model as
+         select 
+            "&model" as model,
+            &datevar,
+            mean(&depvar) as actual_lgd format=8.4,
+            mean(pred_lgd) as pred_lgd format=8.4
+         from _pred_&model
+         where &datevar is not missing
+         group by &datevar;
+      quit;
 
       /* append to final datasets */
       %if &i = 1 %then %do;
@@ -253,7 +244,7 @@
 
    /* clean up workspace */
    proc datasets lib=work nolist;
-      delete _combined _work _pred_: _metrics_: _avg_: _corr_:;
+      delete _combined _work _pred_: _metrics_: _avg_: _vif_results;
    quit;
 
 %mend lgd_censored;
