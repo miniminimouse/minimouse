@@ -385,24 +385,51 @@
       %put NOTE: Creating plot for &model model;
       
       /* create plot data for this specific model from its avg_final dataset */
-      data lgd_&model._plot_data;
-         set lgd_&model._date_avg_final;
-         
-         /* create separate series for actual and predicted by sample */
-         length series_name $50;
-         
-         /* actual values */
-         value = actual_lgd;
-         series_name = catx(' ', 'Actual', sample);
-         output;
-         
-         /* predicted values */
-         value = pred_lgd;
-         series_name = catx(' ', 'Predicted', sample);
-         output;
-         
-         keep &datevar value series_name model sample;
-      run;
+      %if &model = CG %then %do;
+         /* For CG model, apply transformation to fix inverted predictions */
+         data lgd_&model._plot_data;
+            set lgd_&model._date_avg_final;
+            
+            /* Apply 1-minus transformation to CG predictions */
+            pred_lgd_corrected = 1 - pred_lgd;
+            
+            /* create separate series for actual and predicted by sample */
+            length series_name $50;
+            
+            /* actual values */
+            value = actual_lgd;
+            series_name = catx(' ', 'Actual', sample);
+            output;
+            
+            /* predicted values - use corrected for CG */
+            value = pred_lgd_corrected;
+            series_name = catx(' ', 'Predicted', sample);
+            output;
+            
+            keep &datevar value series_name model sample;
+         run;
+      %end;
+      %else %do;
+         /* For other models, use predictions as-is */
+         data lgd_&model._plot_data;
+            set lgd_&model._date_avg_final;
+            
+            /* create separate series for actual and predicted by sample */
+            length series_name $50;
+            
+            /* actual values */
+            value = actual_lgd;
+            series_name = catx(' ', 'Actual', sample);
+            output;
+            
+            /* predicted values */
+            value = pred_lgd;
+            series_name = catx(' ', 'Predicted', sample);
+            output;
+            
+            keep &datevar value series_name model sample;
+         run;
+      %end;
       
       /* verify plot data */
       %put NOTE: lgd_&model._plot_data created with:;
@@ -427,35 +454,21 @@
       run;
    %end;
 
-   /* show final results - calculate metrics using SQL from predictions */
-   %put NOTE: Calculating model performance metrics;
+   /* show final results - print individual model metrics datasets */
+   %put NOTE: Printing model performance metrics;
    
-   /* Create comprehensive metrics using SQL */
-   proc sql;
-      create table &outbase._metrics_detailed as
-      select 
-         model,
-         sample,
-         count(*) as n_obs,
-         mean(&depvar - pred_lgd) as bias format=8.4,
-         sqrt(mean((&depvar - pred_lgd)**2)) as rmse format=8.4,
-         mean(abs(&depvar - pred_lgd)) as mae format=8.4,
-         (sum((&depvar - mean(&depvar)) * (pred_lgd - mean(pred_lgd))) / 
-          (sqrt(sum((&depvar - mean(&depvar))**2)) * sqrt(sum((pred_lgd - mean(pred_lgd))**2)))) 
-          as correlation format=8.4,
-         mean(&depvar) as mean_actual format=8.4,
-         mean(pred_lgd) as mean_predicted format=8.4
-      from &outbase._pred
-      group by model, sample
-      order by model, sample desc;
-   quit;
-   
-   /* Print the detailed metrics */
-   proc print data=&outbase._metrics_detailed noobs;
-      title "Model Performance Metrics - Detailed Comparison";
+   proc print data=lgd_TOBIT_metrics_final noobs;
+      title "TOBIT Model Performance Metrics";
    run;
    
-   /* verify DEF_DATE exists in compare dataset - remove the reference that causes error */
+   proc print data=lgd_CG_metrics_final noobs;
+      title "CG Model Performance Metrics";
+   run;
+   
+   proc print data=lgd_BR_metrics_final noobs;
+      title "BR Model Performance Metrics";
+   run;
+   
    %put NOTE: Final datasets created successfully;
 
    /* NO CLEANUP - keeping all intermediate datasets for debugging */
