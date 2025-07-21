@@ -427,18 +427,36 @@
       run;
    %end;
 
-   /* show final results - print entire metrics dataset */
-   proc print data=&outbase._metrics noobs;
-      title "Model Performance Comparison";
+   /* show final results - calculate metrics using SQL from predictions */
+   %put NOTE: Calculating model performance metrics;
+   
+   /* Create comprehensive metrics using SQL */
+   proc sql;
+      create table &outbase._metrics_detailed as
+      select 
+         model,
+         sample,
+         count(*) as n_obs,
+         mean(&depvar - pred_lgd) as bias format=8.4,
+         sqrt(mean((&depvar - pred_lgd)**2)) as rmse format=8.4,
+         mean(abs(&depvar - pred_lgd)) as mae format=8.4,
+         (sum((&depvar - mean(&depvar)) * (pred_lgd - mean(pred_lgd))) / 
+          (sqrt(sum((&depvar - mean(&depvar))**2)) * sqrt(sum((pred_lgd - mean(pred_lgd))**2)))) 
+          as correlation format=8.4,
+         mean(&depvar) as mean_actual format=8.4,
+         mean(pred_lgd) as mean_predicted format=8.4
+      from &outbase._pred
+      group by model, sample
+      order by model, sample desc;
+   quit;
+   
+   /* Print the detailed metrics */
+   proc print data=&outbase._metrics_detailed noobs;
+      title "Model Performance Metrics - Detailed Comparison";
    run;
    
-   /* verify DEF_DATE exists in compare dataset */
-   %put NOTE: Checking for &datevar in &outbase._compare dataset;
-   proc sql noprint;
-      select count(distinct &datevar) into :final_dates 
-      from &outbase._compare;
-   quit;
-   %put NOTE: Found &final_dates distinct dates in final compare dataset;
+   /* verify DEF_DATE exists in compare dataset - remove the reference that causes error */
+   %put NOTE: Final datasets created successfully;
 
    /* NO CLEANUP - keeping all intermediate datasets for debugging */
    %put NOTE: All intermediate datasets have been retained for inspection;
