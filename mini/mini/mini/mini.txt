@@ -1,6 +1,3 @@
-/* lgd_censored.sas - comprehensive lgd modeling framework */
-/* fits tobit, censored gamma, and beta regression models */
-
 %macro lgd_censored(
       train= ,          
       oot=   ,          
@@ -385,6 +382,8 @@
    %do i = 1 %to &nmodels;
       %let model = %upcase(%scan(&models,&i));
       
+      %put NOTE: Creating plot for &model model;
+      
       /* create plot data for this specific model from its avg_final dataset */
       data lgd_&model._plot_data;
          set lgd_&model._date_avg_final;
@@ -405,8 +404,16 @@
          keep &datevar value series_name model sample;
       run;
       
-      /* create plot for this model */
-      ods graphics / reset width=12in height=8in;
+      /* verify plot data */
+      %put NOTE: lgd_&model._plot_data created with:;
+      proc sql noprint;
+         select count(*), count(distinct model) into :plot_rows, :plot_models
+         from lgd_&model._plot_data;
+      quit;
+      %put NOTE: &plot_rows rows and &plot_models distinct models;
+      
+      /* create plot for this specific model */
+      ods graphics / reset width=12in height=8in imagename="lgd_&model._backtest";
       proc sgplot data=lgd_&model._plot_data;
          series x=&datevar y=value / group=series_name
                 lineattrs=(thickness=2)
@@ -420,10 +427,9 @@
       run;
    %end;
 
-   /* show final results */
+   /* show final results - print entire metrics dataset */
    proc print data=&outbase._metrics noobs;
       title "Model Performance Comparison";
-      var model sample n_obs bias rmse mae correlation;
    run;
    
    /* verify DEF_DATE exists in compare dataset */
@@ -451,14 +457,3 @@
    %put NOTE:   &outbase._compare - date-level comparisons;
 
 %mend lgd_censored;
-
-
-%lgd_censored(
-   train=lgd_training_data,
-   oot=lgd_oot_data, 
-   depvar=lgd_36M,
-   indep=&all_vars,
-   datevar=def_date,
-   models=TOBIT CG BR,
-   outbase=lgd_results
-);
