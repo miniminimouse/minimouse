@@ -93,8 +93,7 @@ def lgd_datastaging(orig_data, stage1_vars, stage2_vars, lgd_var,
     lgd_stage2_wf_wadj = lgd_stage2_wf_wadj[mask].copy()
     
     # Create two rows for each original row (condition a and b)
-    rows_a = []
-    rows_b = []
+    all_rows = []
     
     for idx, row in lgd_stage2_wf_wadj.iterrows():
         lgd_val = row[lgd_var]
@@ -103,20 +102,56 @@ def lgd_datastaging(orig_data, stage1_vars, stage2_vars, lgd_var,
         row_a = row.copy()
         row_a['algd_adj'] = 1
         row_a['wt'] = lgd_val
-        rows_a.append(row_a)
+        all_rows.append(row_a)
         
         # Condition "b": algd_adj=0, wt=1-lgd_var  
         row_b = row.copy()
         row_b['algd_adj'] = 0
         row_b['wt'] = 1 - lgd_val
-        rows_b.append(row_b)
+        all_rows.append(row_b)
     
-    # Combine both sets of rows
-    lgd_stage2_wf_wadj = pd.concat([
-        pd.DataFrame(rows_a), 
-        pd.DataFrame(rows_b)
-    ], ignore_index=True)
+    # Create new DataFrame with doubled rows
+    lgd_stage2_wf_wadj = pd.DataFrame(all_rows).reset_index(drop=True)
     
     results['lgd_stage2_wf_wadj'] = lgd_stage2_wf_wadj
+    
+    return results
+
+def performance_metrics(data, actual_var, pred_var, date_var=None):
+    """
+    Calculate performance metrics (MAE, RMSE) and return aggregated data for plotting
+    
+    Parameters:
+    - data: DataFrame with actual and predicted values
+    - actual_var: name of actual variable column
+    - pred_var: name of predicted variable column  
+    - date_var: name of date variable for aggregation (optional)
+    
+    Returns:
+    - dict with MAE, RMSE, and aggregated data
+    """
+    # Calculate overall metrics
+    mae = mean_absolute_error(data[actual_var], data[pred_var])
+    rmse = np.sqrt(mean_squared_error(data[actual_var], data[pred_var]))
+    
+    results = {
+        'mae': mae,
+        'rmse': rmse,
+        'aggregated_data': None
+    }
+    
+    # If date variable provided, aggregate by date
+    if date_var and date_var in data.columns:
+        # Group by date and calculate means
+        agg_data = data.groupby(date_var).agg({
+            actual_var: 'mean',
+            pred_var: 'mean'
+        }).reset_index()
+        
+        # Rename columns to match SAS output format
+        agg_data.columns = [date_var, actual_var, pred_var]
+        agg_data['Type'] = 'HIST'  # Default type
+        
+        results['aggregated_data'] = agg_data
     
     return results
