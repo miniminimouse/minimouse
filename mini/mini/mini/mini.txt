@@ -863,4 +863,3 @@ def twostage_lgd(stage1_data, stage2_data, score_hist, score_oot,
     
     print("Two-Stage LGD Modeling Complete!")
     return results
-
