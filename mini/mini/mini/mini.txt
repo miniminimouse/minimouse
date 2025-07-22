@@ -1,490 +1,450 @@
-%macro lgd_censored(
-      train= ,          
-      oot=   ,          
-      depvar= ,         
-      indep=  ,         
-      datevar=def_date, 
-      models=TOBIT CG BR,     
-      outbase=lgd_out   
-   );
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
 
-   %let eps = 1e-6;     
-
-   /* count variables and clean up the list - remove duplicates */
-   %let var_count = %sysfunc(countw(&indep));
-   %put NOTE: Processing &var_count predictor variables;
-   %put NOTE: Date variable is &datevar;
-   %put NOTE: Dependent variable is &depvar;
-   
-   /* create clean variable list without duplicates */
-   %let clean_indep = ;
-   %do j = 1 %to &var_count;
-      %let thisvar = %scan(&indep,&j);
-      %if %index(&clean_indep,&thisvar) = 0 %then %do;
-         %let clean_indep = &clean_indep &thisvar;
-      %end;
-   %end;
-   %let clean_indep = %sysfunc(strip(&clean_indep));
-   %let var_count = %sysfunc(countw(&clean_indep));
-   %put NOTE: Clean variable list: &clean_indep;
-   %put NOTE: Final variable count: &var_count;
-
-   /* basic data stacking and prep */
-   data lgd_combined_raw;
-      length sample $10;
-      set &train(in=a) &oot(in=b);
-      
-      if a then sample='TRAIN';
-      else if b then sample='OOT';
-      
-      /* create unique observation ID for merging later */
-      obs_id = _n_;
-      
-      /* remove missing or out of bounds observations */
-      if missing(&depvar) then delete;
-      if &depvar < 0 or &depvar > 1 then delete;
-      
-      /* check for missing predictors */
-      if nmiss(of &clean_indep) > 0 then delete;
-      
-      /* explicitly check that date variable exists */
-      if missing(&datevar) then do;
-         put "WARNING: Missing &datevar for obs_id=" obs_id;
-      end;
-   run;
-
-   /* verify def_date exists in the combined data */
-   proc contents data=lgd_combined_raw noprint out=contents_check;
-   run;
-   
-   data _null_;
-      set contents_check;
-      if upcase(name) = upcase("&datevar") then do;
-         put "NOTE: &datevar found in combined dataset with type=" type "format=" format;
-      end;
-   run;
-
-   /* quick data summary */
-   proc sql noprint;
-      select count(*) into :total_obs from lgd_combined_raw;
-      select count(*) into :train_obs from lgd_combined_raw where sample='TRAIN';
-      select count(*) into :oot_obs from lgd_combined_raw where sample='OOT';
-      select count(distinct &datevar) into :n_dates from lgd_combined_raw;
-   quit;
-
-   %put NOTE: Dataset summary - Total: &total_obs, Train: &train_obs, OOT: &oot_obs;
-   %put NOTE: Number of distinct &datevar values: &n_dates;
-
-   /* check multicollinearity with vif values - training data only */
-   proc reg data=lgd_combined_raw(where=(sample='TRAIN')) outest=reg_estimates;
-      model &depvar = &clean_indep / vif;
-      ods output ParameterEstimates=vif_analysis_results;
-   run;
-   quit;
-
-   /* show vif results if dataset exists */
-   %if %sysfunc(exist(vif_analysis_results)) %then %do;
-      proc print data=vif_analysis_results noobs;
-         title "VIF Analysis - Multicollinearity Check";
-         var Variable Estimate StdErr tValue Probt VarianceInflation;
-         where Variable ne 'Intercept';
-         format Estimate StdErr 8.4 tValue 8.2 Probt 8.4 VarianceInflation 8.2;
-      run;
-
-      /* flag high vif variables */
-      data _null_;
-         set vif_analysis_results;
-         where Variable ne 'Intercept' and VarianceInflation > 5;
-         if _n_ = 1 then put "WARNING: Variables with VIF > 5 detected:";
-         put Variable "VIF=" VarianceInflation 8.2;
-      run;
-   %end;
-
-   /* initialize the final output datasets */
-   data &outbase._pred;
-      length sample $10 model $10;
-      stop;
-   run;
-   
-   data &outbase._metrics;
-      length model $10 sample $10;
-      stop;
-   run;
-   
-   data &outbase._compare;
-      length model $10 sample $10;
-      stop;
-   run;
-
-   /* loop through each model */
-   %let nmodels = %sysfunc(countw(&models));
-   %do i = 1 %to &nmodels;
-      %let model = %upcase(%scan(&models,&i));
-      %put NOTE: Running &model model...;
-
-      /* prep data specific to each model - KEEP ALL VARIABLES */
-      data lgd_&model._work;
-         set lgd_combined_raw;  /* this brings in ALL variables including def_date */
-         
-         /* store original lgd value before any transformation */
-         original_lgd = &depvar;
-         
-         %if &model = BR %then %do;
-            /* beta regression needs open interval (0,1) */
-            if &depvar = 0 then &depvar = &eps;
-            else if &depvar = 1 then &depvar = 1-&eps;
-         %end;
-      run;
-
-      /* verify date variable still exists */
-      %put NOTE: Checking &datevar in lgd_&model._work dataset;
-      proc sql noprint;
-         select count(distinct &datevar) into :check_dates 
-         from lgd_&model._work;
-      quit;
-      %put NOTE: Found &check_dates distinct dates in lgd_&model._work;
-
-      /* run the appropriate model */
-      %if &model = TOBIT %then %do;
-         /* tobit model using proc qlim */
-         proc qlim data=lgd_&model._work;
-            model &depvar = &clean_indep;
-            endogenous &depvar ~ censored(lb=0 ub=1);
-            output out=lgd_&model._raw_pred predicted marginal;
-         run;
-         
-         /* merge predictions - KEEP ALL ORIGINAL VARIABLES */
-         proc sort data=lgd_&model._work; by obs_id; run;
-         proc sort data=lgd_&model._raw_pred; by obs_id; run;
-         
-         data lgd_&model._predictions;
-            merge lgd_&model._work(in=a)  /* brings ALL variables */
-                  lgd_&model._raw_pred(keep=obs_id p_&depvar);
-            by obs_id;
-            if a;  /* only keep observations from original data */
+def lgd_datastaging(orig_data, stage1_vars, stage2_vars, lgd_var, 
+                   id_var='LOAN_NUMBER', date_var='def_date'):
+    """
+    Python implementation of SAS lgd_datastaging macro
+    Creates properly staged data for two-stage LGD modeling
+    
+    Parameters:
+    - orig_data: Original DataFrame
+    - stage1_vars: List of stage 1 variables
+    - stage2_vars: List of stage 2 variables  
+    - lgd_var: Name of LGD variable
+    - id_var: ID variable name
+    - date_var: Date variable name
+    
+    Returns:
+    - Dictionary containing stage1, stage2, and combined datasets
+    """
+    
+    results = {}
+    
+    # Stage 1 dataset
+    stage1_keep_vars = stage1_vars + [lgd_var, id_var, date_var]
+    lgd_stage1 = orig_data[stage1_keep_vars].copy()
+    lgd_stage1['wt'] = 1
+    results['lgd_stage1'] = lgd_stage1
+    
+    # Stage 2 dataset  
+    stage2_keep_vars = stage2_vars + [lgd_var, id_var, date_var]
+    lgd_stage2 = orig_data[stage2_keep_vars].copy()
+    lgd_stage2['wt'] = 1
+    results['lgd_stage2'] = lgd_stage2
+    
+    # Combined dataset with all variables
+    all_vars = list(set(stage1_vars + stage2_vars + [lgd_var, id_var, date_var]))
+    lgd_stage_all = orig_data[all_vars].copy()
+    lgd_stage_all['wt'] = 1
+    results['lgd_stage_all'] = lgd_stage_all
+    
+    # Adding staging flags to stage1 dataset
+    lgd_stage1_wf = lgd_stage1.copy()
+    
+    # Create LGD category flags
+    lgd_stage1_wf['lgd_0'] = (lgd_stage1_wf[lgd_var] == 0).astype(int)
+    lgd_stage1_wf['lgd_1'] = (lgd_stage1_wf[lgd_var] == 1).astype(int)
+    lgd_stage1_wf['lgd_0_1'] = ((lgd_stage1_wf[lgd_var] > 0) & 
+                                (lgd_stage1_wf[lgd_var] < 1)).astype(int)
+    lgd_stage1_wf['lgd_0_1_inc'] = ((lgd_stage1_wf[lgd_var] > 0) & 
+                                    (lgd_stage1_wf[lgd_var] <= 1)).astype(int)
+    
+    results['lgd_stage1_wf'] = lgd_stage1_wf
+    
+    # Adding staging flags to stage2 dataset
+    lgd_stage2_wf = lgd_stage2.copy()
+    
+    # Create LGD category flags (same as stage1)
+    lgd_stage2_wf['lgd_0'] = (lgd_stage2_wf[lgd_var] == 0).astype(int)
+    lgd_stage2_wf['lgd_1'] = (lgd_stage2_wf[lgd_var] == 1).astype(int)
+    lgd_stage2_wf['lgd_0_1'] = ((lgd_stage2_wf[lgd_var] > 0) & 
+                                (lgd_stage2_wf[lgd_var] < 1)).astype(int)
+    lgd_stage2_wf['lgd_0_1_inc'] = ((lgd_stage2_wf[lgd_var] > 0) & 
+                                    (lgd_stage2_wf[lgd_var] <= 1)).astype(int)
+    
+    results['lgd_stage2_wf'] = lgd_stage2_wf
+    
+    # Adding staging flags to combined dataset
+    lgd_stage_all_wf = lgd_stage_all.copy()
+    
+    # Create LGD category flags (same as above)
+    lgd_stage_all_wf['lgd_0'] = (lgd_stage_all_wf[lgd_var] == 0).astype(int)
+    lgd_stage_all_wf['lgd_1'] = (lgd_stage_all_wf[lgd_var] == 1).astype(int)
+    lgd_stage_all_wf['lgd_0_1'] = ((lgd_stage_all_wf[lgd_var] > 0) & 
+                                   (lgd_stage_all_wf[lgd_var] < 1)).astype(int)
+    lgd_stage_all_wf['lgd_0_1_inc'] = ((lgd_stage_all_wf[lgd_var] > 0) & 
+                                       (lgd_stage_all_wf[lgd_var] <= 1)).astype(int)
+    
+    results['lgd_stage_all_wf'] = lgd_stage_all_wf
+    
+    # Stage 1 y creation
+    lgd_stage1_wf_wadj = lgd_stage1_wf.copy()
+    
+    # Create LGD_Stage1: 1 if lgd_var = 0, 2 otherwise
+    lgd_stage1_wf_wadj['LGD_Stage1'] = np.where(
+        lgd_stage1_wf_wadj[lgd_var] == 0, 1, 2
+    )
+    
+    results['lgd_stage1_wf_wadj'] = lgd_stage1_wf_wadj
+    
+    # Stage 2 algd_adj creation
+    lgd_stage2_wf_wadj = lgd_stage2_wf.copy()
+    
+    # Filter to only include cases where 0 < lgd_var <= 1
+    mask = (lgd_stage2_wf_wadj[lgd_var] > 0) & (lgd_stage2_wf_wadj[lgd_var] <= 1)
+    lgd_stage2_wf_wadj = lgd_stage2_wf_wadj[mask].copy()
+    
+    # Create algd_adj and wt based on conditions
+    def create_algd_adj_and_wt(row):
+        lgd_val = row[lgd_var]
+        if lgd_val > 0 and lgd_val <= 1:
+            # This corresponds to "a" condition in SAS
+            algd_adj = 1
+            wt = lgd_val
+        else:
+            # This corresponds to "b" condition in SAS  
+            algd_adj = 0
+            wt = 1 - lgd_val
             
-            length model $10;
-            model = "&model";
-            pred_lgd = p_&depvar;
-            &depvar = original_lgd;  /* restore original value */
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
+        return pd.Series({'algd_adj': algd_adj, 'wt': wt})
+    
+    # Apply the function to create algd_adj and wt
+    adj_wt = lgd_stage2_wf_wadj.apply(create_algd_adj_and_wt, axis=1)
+    lgd_stage2_wf_wadj['algd_adj'] = adj_wt['algd_adj']
+    lgd_stage2_wf_wadj['wt'] = adj_wt['wt']
+    
+    results['lgd_stage2_wf_wadj'] = lgd_stage2_wf_wadj
+    
+    return results
+
+def performance_metrics(data, actual_var, pred_var, date_var=None):
+    """
+    Calculate performance metrics (MAE, RMSE) and return aggregated data for plotting
+    
+    Parameters:
+    - data: DataFrame with actual and predicted values
+    - actual_var: name of actual variable column
+    - pred_var: name of predicted variable column  
+    - date_var: name of date variable for aggregation (optional)
+    
+    Returns:
+    - dict with MAE, RMSE, and aggregated data
+    """
+    # Calculate overall metrics
+    mae = mean_absolute_error(data[actual_var], data[pred_var])
+    rmse = np.sqrt(mean_squared_error(data[actual_var], data[pred_var]))
+    
+    results = {
+        'mae': mae,
+        'rmse': rmse,
+        'aggregated_data': None
+    }
+    
+    # If date variable provided, aggregate by date
+    if date_var and date_var in data.columns:
+        # Group by date and calculate means
+        agg_data = data.groupby(date_var).agg({
+            actual_var: 'mean',
+            pred_var: 'mean'
+        }).reset_index()
+        
+        # Rename columns to match SAS output format
+        agg_data.columns = [date_var, actual_var, pred_var]
+        agg_data['Type'] = 'HIST'  # Default type
+        
+        results['aggregated_data'] = agg_data
+    
+    return results
+
+def create_performance_plot(hist_data, oot_data, actual_var, pred_var, date_var, 
+                          model_name, reference_date=None):
+    """
+    Create performance plot similar to SAS SGPLOT
+    
+    Parameters:
+    - hist_data: Historical (training) aggregated data
+    - oot_data: Out-of-time (test) aggregated data  
+    - actual_var: name of actual variable
+    - pred_var: name of predicted variable
+    - date_var: name of date variable
+    - model_name: model name for title
+    - reference_date: reference date for vertical line
+    """
+    # Prepare data for plotting
+    plot_data = []
+    
+    # Add historical data
+    if hist_data is not None:
+        hist_actual = hist_data[[date_var, actual_var]].copy()
+        hist_actual['series_name'] = f'Actual_{model_name}_HIST'
+        hist_actual['value'] = hist_actual[actual_var]
+        
+        hist_pred = hist_data[[date_var, pred_var]].copy()
+        hist_pred['series_name'] = f'Predicted_{model_name}_HIST'
+        hist_pred['value'] = hist_pred[pred_var]
+        
+        plot_data.extend([hist_actual, hist_pred])
+    
+    # Add OOT data
+    if oot_data is not None:
+        oot_actual = oot_data[[date_var, actual_var]].copy()
+        oot_actual['series_name'] = f'Actual_{model_name}_OOT'
+        oot_actual['value'] = oot_actual[actual_var]
+        
+        oot_pred = oot_data[[date_var, pred_var]].copy()
+        oot_pred['series_name'] = f'Predicted_{model_name}_OOT'
+        oot_pred['value'] = oot_pred[pred_var]
+        
+        plot_data.extend([oot_actual, oot_pred])
+    
+    # Combine all data
+    if plot_data:
+        combined_data = pd.concat(plot_data, ignore_index=True)
+        
+        # Create the plot
+        plt.figure(figsize=(12, 8))
+        
+        # Plot lines for each series
+        for series in combined_data['series_name'].unique():
+            series_data = combined_data[combined_data['series_name'] == series]
             
-            /* explicitly keep key variables plus all others */
-            /* not using keep statement so ALL variables are retained */
-         run;
-      %end;
-
-      %else %if &model = CG %then %do;
-         /* censored gamma model */
-         proc nlmixed data=lgd_&model._work tech=newrap qpoints=1 maxiter=200;
-            parms beta0=0
-            %do j=1 %to &var_count;
-               b&j=0
-            %end;
-            logalpha=0;
-
-            /* build linear predictor */
-            eta = beta0;
-            %do j=1 %to &var_count;
-               %let thisvar = %scan(&clean_indep,&j);
-               eta = eta + b&j * &thisvar;
-            %end;
+            # Determine line style and color
+            if 'HIST' in series:
+                linestyle = '-'
+                alpha = 0.8
+            else:
+                linestyle = '--'
+                alpha = 0.8
+                
+            if 'Actual' in series:
+                color = 'blue' if 'HIST' in series else 'darkblue'
+                marker = 'o'
+            else:
+                color = 'red' if 'HIST' in series else 'darkred' 
+                marker = 's'
             
-            mu = exp(eta);
-            alpha = exp(logalpha);
-            scale = mu / alpha;
+            plt.plot(pd.to_datetime(series_data[date_var]), series_data['value'], 
+                    label=series, linewidth=2, linestyle=linestyle, 
+                    color=color, marker=marker, markersize=4, alpha=alpha)
+        
+        # Add reference line if provided
+        if reference_date:
+            plt.axvline(pd.to_datetime(reference_date), color='black', 
+                       linestyle='--', linewidth=2, alpha=0.7, label='Reference Date')
+        
+        # Formatting
+        plt.xlabel('Default Date', fontsize=10)
+        plt.ylabel('LGD Level', fontsize=10)
+        plt.title(f'{model_name} Model - Train vs OOT Performance', fontsize=14)
+        plt.ylim(0, 1)
+        plt.legend(loc='upper right', bbox_to_anchor=(1, 1))
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-            /* censored gamma log-likelihood */
-            if &depvar <= &eps then 
-               ll = log(cdf('gamma', &eps, alpha, scale));
-            else if &depvar >= 1-&eps then 
-               ll = log(1 - cdf('gamma', 1-&eps, alpha, scale));
-            else 
-               ll = log(pdf('gamma', &depvar, alpha, scale));
+def twostage_lgd(stage1_data, stage2_data, score_hist, score_oot, 
+                id_var='loan_number', date_var='def_date', lgd_var='lgd_36m',
+                stage1_vars=None, stage2_vars=None, outprefix='tg_', 
+                reference_date=None, create_plots=True):
+    """
+    Python implementation of SAS two-stage LGD modeling macro
+    
+    Parameters:
+    - stage1_data: DataFrame for stage 1 model training
+    - stage2_data: DataFrame for stage 2 model training  
+    - score_hist: DataFrame for historical scoring
+    - score_oot: DataFrame for out-of-time scoring
+    - id_var: ID variable name
+    - date_var: Date variable name
+    - lgd_var: LGD variable name
+    - stage1_vars: List of stage 1 variables
+    - stage2_vars: List of stage 2 variables  
+    - outprefix: Output prefix for results
+    - reference_date: Reference date for plots
+    - create_plots: Whether to create performance plots
+    
+    Returns:
+    - Dictionary with models, scored data, and performance metrics
+    """
+    
+    results = {}
+    
+    # Stage 1: Probability of Loss Model
+    print("Training Stage 1 Model - Probability of Loss...")
+    
+    # Prepare stage 1 data - use LGD_Stage1 as target
+    stage1_y = stage1_data['LGD_Stage1'] - 1  # Convert 1,2 to 0,1
+    stage1_X = stage1_data[stage1_vars] if stage1_vars else stage1_data.drop([id_var, 'LGD_Stage1', lgd_var], axis=1)
+    
+    # Train stage 1 model
+    stage1_model = LogisticRegression(random_state=42, max_iter=1000)
+    stage1_model.fit(stage1_X, stage1_y)
+    results['stage1_model'] = stage1_model
+    
+    # Stage 2: E(LGD | Loss) Model  
+    print("Training Stage 2 Model - E(LGD | Loss)...")
+    
+    # Prepare stage 2 data
+    stage2_y = stage2_data['algd_adj']  # Adjusted LGD for positive cases
+    stage2_X = stage2_data[stage2_vars] if stage2_vars else stage2_data.drop([id_var, 'algd_adj', 'wt', lgd_var], axis=1)
+    
+    # Get sample weights if available
+    sample_weights = stage2_data['wt'] if 'wt' in stage2_data.columns else None
+    
+    # Train stage 2 model
+    stage2_model = LogisticRegression(random_state=42, max_iter=1000)
+    stage2_model.fit(stage2_X, stage2_y, sample_weight=sample_weights)
+    results['stage2_model'] = stage2_model
+    
+    # Score Historical Data
+    print("Scoring Historical Data...")
+    
+    # Stage 1 scoring - get P_2 (probability of loss)
+    hist_stage1_X = score_hist[stage1_vars] if stage1_vars else score_hist[stage1_X.columns]
+    hist_stage1_probs = stage1_model.predict_proba(hist_stage1_X)
+    hist_p_loss = hist_stage1_probs[:, 1]  # P_1: probability of class 1 (loss > 0)
+    
+    # Stage 2 scoring - get P_1 (probability of positive LGD weights)  
+    hist_stage2_X = score_hist[stage2_vars] if stage2_vars else score_hist[stage2_X.columns]
+    hist_stage2_probs = stage2_model.predict_proba(hist_stage2_X)
+    hist_p_lgd = hist_stage2_probs[:, 1]  # P_1: probability of class 1 (positive weights)
+    
+    # Create scored historical dataset
+    scored_hist = score_hist.copy()
+    scored_hist['p_loss'] = hist_p_loss
+    scored_hist['p_lgd'] = hist_p_lgd
+    scored_hist['pred_lgd'] = hist_p_loss * hist_p_lgd
+    
+    # Create binary flags if missing
+    if 'lgd_stage1' not in scored_hist.columns:
+        scored_hist['lgd_stage1'] = (scored_hist[lgd_var] > 0).astype(int)
+    if 'algd_adj' not in scored_hist.columns:
+        scored_hist['algd_adj'] = (scored_hist[lgd_var] > 0).astype(int)
+    
+    results['scored_hist'] = scored_hist
+    
+    # Score OOT Data
+    print("Scoring OOT Data...")
+    
+    # Stage 1 scoring
+    oot_stage1_X = score_oot[stage1_vars] if stage1_vars else score_oot[stage1_X.columns]
+    oot_stage1_probs = stage1_model.predict_proba(oot_stage1_X)
+    oot_p_loss = oot_stage1_probs[:, 1]
+    
+    # Stage 2 scoring
+    oot_stage2_X = score_oot[stage2_vars] if stage2_vars else score_oot[stage2_X.columns]
+    oot_stage2_probs = stage2_model.predict_proba(oot_stage2_X)
+    oot_p_lgd = oot_stage2_probs[:, 1]
+    
+    # Create scored OOT dataset
+    scored_oot = score_oot.copy()
+    scored_oot['p_loss'] = oot_p_loss
+    scored_oot['p_lgd'] = oot_p_lgd
+    scored_oot['pred_lgd'] = oot_p_loss * oot_p_lgd
+    
+    # Create binary flags if missing
+    if 'lgd_stage1' not in scored_oot.columns:
+        scored_oot['lgd_stage1'] = (scored_oot[lgd_var] > 0).astype(int)
+    if 'algd_adj' not in scored_oot.columns:
+        scored_oot['algd_adj'] = (scored_oot[lgd_var] > 0).astype(int)
+    
+    results['scored_oot'] = scored_oot
+    
+    # Performance Metrics
+    print("Calculating Performance Metrics...")
+    
+    metrics = {}
+    
+    # Stage 1 HIST
+    stage1_hist_metrics = performance_metrics(scored_hist, 'lgd_stage1', 'p_loss', date_var)
+    metrics['stage1_hist'] = stage1_hist_metrics
+    print(f"Stage-1 HIST - MAE: {stage1_hist_metrics['mae']:.4f}, RMSE: {stage1_hist_metrics['rmse']:.4f}")
+    
+    # Stage 2 HIST  
+    stage2_hist_metrics = performance_metrics(scored_hist, 'algd_adj', 'p_lgd', date_var)
+    metrics['stage2_hist'] = stage2_hist_metrics
+    print(f"Stage-2 HIST - MAE: {stage2_hist_metrics['mae']:.4f}, RMSE: {stage2_hist_metrics['rmse']:.4f}")
+    
+    # Combined HIST
+    combined_hist_metrics = performance_metrics(scored_hist, lgd_var, 'pred_lgd', date_var)
+    metrics['combined_hist'] = combined_hist_metrics
+    print(f"Combined HIST - MAE: {combined_hist_metrics['mae']:.4f}, RMSE: {combined_hist_metrics['rmse']:.4f}")
+    
+    # Stage 1 OOT
+    stage1_oot_metrics = performance_metrics(scored_oot, 'lgd_stage1', 'p_loss', date_var)
+    metrics['stage1_oot'] = stage1_oot_metrics
+    print(f"Stage-1 OOT - MAE: {stage1_oot_metrics['mae']:.4f}, RMSE: {stage1_oot_metrics['rmse']:.4f}")
+    
+    # Stage 2 OOT
+    stage2_oot_metrics = performance_metrics(scored_oot, 'algd_adj', 'p_lgd', date_var)
+    metrics['stage2_oot'] = stage2_oot_metrics
+    print(f"Stage-2 OOT - MAE: {stage2_oot_metrics['mae']:.4f}, RMSE: {stage2_oot_metrics['rmse']:.4f}")
+    
+    # Combined OOT
+    combined_oot_metrics = performance_metrics(scored_oot, lgd_var, 'pred_lgd', date_var)
+    metrics['combined_oot'] = combined_oot_metrics
+    print(f"Combined OOT - MAE: {combined_oot_metrics['mae']:.4f}, RMSE: {combined_oot_metrics['rmse']:.4f}")
+    
+    results['metrics'] = metrics
+    
+    # Create Performance Plots
+    if create_plots:
+        print("Creating Performance Plots...")
+        
+        # Stage 1 Plot
+        create_performance_plot(
+            stage1_hist_metrics['aggregated_data'],
+            stage1_oot_metrics['aggregated_data'], 
+            'lgd_stage1', 'p_loss', date_var,
+            'Stage-1', reference_date
+        )
+        
+        # Stage 2 Plot
+        create_performance_plot(
+            stage2_hist_metrics['aggregated_data'],
+            stage2_oot_metrics['aggregated_data'],
+            'algd_adj', 'p_lgd', date_var, 
+            'Stage-2', reference_date
+        )
+        
+        # Combined Plot
+        create_performance_plot(
+            combined_hist_metrics['aggregated_data'],
+            combined_oot_metrics['aggregated_data'],
+            lgd_var, 'pred_lgd', date_var,
+            'Combined', reference_date
+        )
+    
+    print("Two-Stage LGD Modeling Complete!")
+    return results
 
-            model &depvar ~ general(ll);
-            predict mu out=lgd_&model._nlmix_pred(rename=(pred=pred_lgd));
-         run;
-         
-         /* merge predictions - KEEP ALL VARIABLES */
-         proc sort data=lgd_&model._work; by obs_id; run;
-         proc sort data=lgd_&model._nlmix_pred; by obs_id; run;
-         
-         data lgd_&model._predictions;
-            merge lgd_&model._work(in=a)  /* brings ALL variables */
-                  lgd_&model._nlmix_pred(keep=obs_id pred_lgd);
-            by obs_id;
-            if a;
-            
-            length model $10;
-            model = "&model";
-            &depvar = original_lgd;  /* restore original value */
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
-         run;
-      %end;
+# Example usage:
+"""
+# Step 1: Prepare the data
+staging_results = lgd_datastaging(
+    orig_data=your_dataframe,
+    stage1_vars=['var1', 'var2', 'var3'],
+    stage2_vars=['var4', 'var5', 'var6'], 
+    lgd_var='lgd_36m'
+)
 
-      %else %if &model = BR %then %do;
-         /* beta regression model */
-         proc nlmixed data=lgd_&model._work tech=newrap qpoints=1 maxiter=200;
-            parms beta0=0
-            %do j=1 %to &var_count;
-               b&j=0
-            %end;
-            logphi=0;
-
-            /* linear predictor */
-            eta = beta0;
-            %do j=1 %to &var_count;
-               %let thisvar = %scan(&clean_indep,&j);
-               eta = eta + b&j * &thisvar;
-            %end;
-            
-            mu = exp(eta) / (1 + exp(eta));
-            phi = exp(logphi);
-
-            /* beta distribution log-likelihood */
-            ll = lgamma(phi) - lgamma(mu*phi) - lgamma((1-mu)*phi) +
-                 (mu*phi-1)*log(&depvar) + ((1-mu)*phi-1)*log(1-&depvar);
-
-            model &depvar ~ general(ll);
-            predict mu out=lgd_&model._nlmix_out(rename=(pred=pred_lgd));
-         run;
-         
-         /* merge predictions - KEEP ALL VARIABLES */
-         proc sort data=lgd_&model._work; by obs_id; run;
-         proc sort data=lgd_&model._nlmix_out; by obs_id; run;
-         
-         data lgd_&model._predictions;
-            merge lgd_&model._work(in=a)  /* brings ALL variables */
-                  lgd_&model._nlmix_out(keep=obs_id pred_lgd);
-            by obs_id;
-            if a;
-            
-            length model $10;
-            model = "&model";
-            &depvar = original_lgd;  /* use original untransformed value */
-            residual = &depvar - pred_lgd;
-            abs_residual = abs(residual);
-            if pred_lgd < 0 then pred_lgd = 0;
-            if pred_lgd > 1 then pred_lgd = 1;
-         run;
-      %end;
-
-      /* verify def_date exists in predictions */
-      %put NOTE: Verifying &datevar in lgd_&model._predictions;
-      proc sql noprint;
-         select count(*), count(distinct &datevar) into :n_pred, :n_dates_pred
-         from lgd_&model._predictions;
-      quit;
-      %put NOTE: lgd_&model._predictions has &n_pred rows and &n_dates_pred distinct dates;
-
-      /* sort data for by processing */
-      proc sort data=lgd_&model._predictions;
-         by sample;
-      run;
-
-      /* calculate correlation using proc corr */
-      proc corr data=lgd_&model._predictions noprint outp=lgd_&model._corr_out;
-         var &depvar pred_lgd;
-         by sample;
-      run;
-
-      /* extract correlation value */
-      data lgd_&model._corr_values;
-         set lgd_&model._corr_out;
-         if _type_ = 'CORR' and _name_ = "&depvar";
-         correlation = pred_lgd;
-         keep sample correlation;
-      run;
-
-      /* calculate other metrics using proc means */
-      proc means data=lgd_&model._predictions noprint;
-         class sample;
-         var residual abs_residual;
-         output out=lgd_&model._metrics_raw(where=(sample ne ''))
-                mean(residual)=bias 
-                std(residual)=rmse
-                mean(abs_residual)=mae
-                n=n_obs;
-      run;
-
-      /* combine metrics */
-      proc sort data=lgd_&model._metrics_raw; by sample; run;
-      proc sort data=lgd_&model._corr_values; by sample; run;
-      
-      data lgd_&model._metrics_final;
-         merge lgd_&model._metrics_raw(in=a) lgd_&model._corr_values;
-         by sample;
-         if a;
-         length model $10;
-         model = "&model";
-         if missing(correlation) then correlation = 0;
-         format bias rmse mae correlation 8.4;
-         keep model sample n_obs bias rmse mae correlation;
-      run;
-
-      /* date level aggregation - THIS IS WHERE def_date IS CRITICAL */
-      %put NOTE: Creating date-level aggregation using &datevar;
-      
-      /* first verify the variable exists */
-      proc contents data=lgd_&model._predictions noprint out=pred_contents;
-      run;
-      
-      data _null_;
-         set pred_contents;
-         if upcase(name) = upcase("&datevar") then do;
-            put "NOTE: Found &datevar in predictions with type=" type;
-         end;
-      run;
-      
-      proc sort data=lgd_&model._predictions;
-         by &datevar sample;
-      run;
-      
-      proc means data=lgd_&model._predictions noprint;
-         class &datevar sample;
-         var &depvar pred_lgd;
-         output out=lgd_&model._date_avg_raw(where=(&datevar ne . and sample ne ''))
-                mean(&depvar)=actual_lgd 
-                mean(pred_lgd)=pred_lgd
-                n=n_obs;
-      run;
-
-      data lgd_&model._date_avg_final; 
-         set lgd_&model._date_avg_raw;
-         length model $10;
-         model = "&model"; 
-         format actual_lgd pred_lgd 8.4;
-         keep model &datevar sample actual_lgd pred_lgd n_obs;
-      run;
-
-      /* append results to final datasets */
-      %put NOTE: Appending &model results to final datasets;
-      
-      /* verify datasets before appending */
-      proc contents data=lgd_&model._predictions noprint out=pred_check; run;
-      proc contents data=lgd_&model._metrics_final noprint out=metrics_check; run;
-      proc contents data=lgd_&model._date_avg_final noprint out=avg_check; run;
-      
-      proc append base=&outbase._pred data=lgd_&model._predictions force; run;
-      proc append base=&outbase._metrics data=lgd_&model._metrics_final force; run;
-      proc append base=&outbase._compare data=lgd_&model._date_avg_final force; run;
-
-   %end;
-
-   /* create the plots directly from each model's date_avg_final dataset */
-   %do i = 1 %to &nmodels;
-      %let model = %upcase(%scan(&models,&i));
-      
-      %put NOTE: Creating plot for &model model;
-      
-      /* create plot data for this specific model from its avg_final dataset */
-      %if &model = CG %then %do;
-         /* For CG model, apply transformation to fix inverted predictions */
-         data lgd_&model._plot_data;
-            set lgd_&model._date_avg_final;
-            
-            /* Apply 1-minus transformation to CG predictions */
-            pred_lgd_corrected = 1 - pred_lgd;
-            
-            /* create separate series for actual and predicted by sample */
-            length series_name $50;
-            
-            /* actual values */
-            value = actual_lgd;
-            series_name = catx(' ', 'Actual', sample);
-            output;
-            
-            /* predicted values - use corrected for CG */
-            value = pred_lgd_corrected;
-            series_name = catx(' ', 'Predicted', sample);
-            output;
-            
-            keep &datevar value series_name model sample;
-         run;
-      %end;
-      %else %do;
-         /* For other models, use predictions as-is */
-         data lgd_&model._plot_data;
-            set lgd_&model._date_avg_final;
-            
-            /* create separate series for actual and predicted by sample */
-            length series_name $50;
-            
-            /* actual values */
-            value = actual_lgd;
-            series_name = catx(' ', 'Actual', sample);
-            output;
-            
-            /* predicted values */
-            value = pred_lgd;
-            series_name = catx(' ', 'Predicted', sample);
-            output;
-            
-            keep &datevar value series_name model sample;
-         run;
-      %end;
-      
-      /* verify plot data */
-      %put NOTE: lgd_&model._plot_data created with:;
-      proc sql noprint;
-         select count(*), count(distinct model) into :plot_rows, :plot_models
-         from lgd_&model._plot_data;
-      quit;
-      %put NOTE: &plot_rows rows and &plot_models distinct models;
-      
-      /* create plot for this specific model */
-      ods graphics / reset width=12in height=8in imagename="lgd_&model._backtest";
-      proc sgplot data=lgd_&model._plot_data;
-         series x=&datevar y=value / group=series_name
-                lineattrs=(thickness=2)
-                markers markerattrs=(size=4);
-         refline '30APR2020'd / axis=x lineattrs=(pattern=dash color=black thickness=2)
-                                legendlabel="Reference Date" name="RefLine";
-         xaxis label="Default Date" valueattrs=(size=10pt);
-         yaxis label="LGD Level" valueattrs=(size=10pt) min=0 max=1;
-         keylegend / position=topright across=1;
-         title "&model Model - Train vs OOT Performance" height=14pt;
-      run;
-   %end;
-
-   /* show final results - print individual model metrics datasets */
-   %put NOTE: Printing model performance metrics;
-   
-   proc print data=lgd_TOBIT_metrics_final noobs;
-      title "TOBIT Model Performance Metrics";
-   run;
-   
-   proc print data=lgd_CG_metrics_final noobs;
-      title "CG Model Performance Metrics";
-   run;
-   
-   proc print data=lgd_BR_metrics_final noobs;
-      title "BR Model Performance Metrics";
-   run;
-   
-   %put NOTE: Final datasets created successfully;
-
-   /* NO CLEANUP - keeping all intermediate datasets for debugging */
-   %put NOTE: All intermediate datasets have been retained for inspection;
-   %put NOTE: Dataset naming convention: lgd_[MODEL]_[purpose];
-   %put NOTE: Key datasets to check:;
-   %put NOTE:   lgd_combined_raw - initial combined data;
-   %put NOTE:   lgd_[MODEL]_work - working data for each model;
-   %put NOTE:   lgd_[MODEL]_predictions - predictions with all variables;
-   %put NOTE:   lgd_[MODEL]_date_avg_final - date-level averages with DEF_DATE;
-   %put NOTE:   lgd_[MODEL]_plot_data - data used for plotting;
-   
-   /* verify final output datasets */
-   %put NOTE: Final output datasets created:;
-   %put NOTE:   &outbase._pred - all predictions;
-   %put NOTE:   &outbase._metrics - performance metrics;
-   %put NOTE:   &outbase._compare - date-level comparisons;
-
-%mend lgd_censored;
+# Step 2: Run two-stage LGD modeling
+model_results = twostage_lgd(
+    stage1_data=staging_results['lgd_stage1_wf_wadj'],
+    stage2_data=staging_results['lgd_stage2_wf_wadj'],
+    score_hist=historical_data,
+    score_oot=oot_data,
+    stage1_vars=['var1', 'var2', 'var3'],
+    stage2_vars=['var4', 'var5', 'var6'],
+    lgd_var='lgd_36m',
+    reference_date='2020-04-30'
+)
+"""
