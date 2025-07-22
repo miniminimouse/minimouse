@@ -86,26 +86,22 @@ def lgd_datastaging(orig_data, stage1_vars, stage2_vars, lgd_var,
     results['lgd_stage1_wf_wadj'] = lgd_stage1_wf_wadj
     
     # Stage 2 algd_adj creation
-    lgd_stage2_wf_wadj = lgd_stage2_wf.copy()
-    
     # Filter to only include cases where 0 < lgd_var <= 1
-    mask = (lgd_stage2_wf_wadj[lgd_var] > 0) & (lgd_stage2_wf_wadj[lgd_var] <= 1)
-    lgd_stage2_wf_wadj = lgd_stage2_wf_wadj[mask].copy()
+    mask = (lgd_stage2_wf[lgd_var] > 0) & (lgd_stage2_wf[lgd_var] <= 1)
+    lgd_stage2_filtered = lgd_stage2_wf[mask].copy()
     
-    # Create two copies of the dataset for conditions a and b
+    # Create condition "a" rows: algd_adj=1, wt=lgd_var
+    condition_a = lgd_stage2_filtered.copy()
+    condition_a['algd_adj'] = 1
+    condition_a['wt'] = condition_a[lgd_var]
     
-    # Condition "a": algd_adj=1, wt=lgd_var
-    lgd_stage2_a = lgd_stage2_wf_wadj.copy()
-    lgd_stage2_a['algd_adj'] = 1
-    lgd_stage2_a['wt'] = lgd_stage2_a[lgd_var]
+    # Create condition "b" rows: algd_adj=0, wt=1-lgd_var
+    condition_b = lgd_stage2_filtered.copy()
+    condition_b['algd_adj'] = 0
+    condition_b['wt'] = 1 - condition_b[lgd_var]
     
-    # Condition "b": algd_adj=0, wt=1-lgd_var
-    lgd_stage2_b = lgd_stage2_wf_wadj.copy()
-    lgd_stage2_b['algd_adj'] = 0
-    lgd_stage2_b['wt'] = 1 - lgd_stage2_b[lgd_var]
-    
-    # Stack both datasets
-    lgd_stage2_wf_wadj = pd.concat([lgd_stage2_a, lgd_stage2_b], ignore_index=True)
+    # Combine both conditions
+    lgd_stage2_wf_wadj = pd.concat([condition_a, condition_b], ignore_index=True)
     
     results['lgd_stage2_wf_wadj'] = lgd_stage2_wf_wadj
     
