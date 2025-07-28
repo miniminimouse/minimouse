@@ -1,3 +1,9 @@
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Optional, Tuple, Union
+from datetime import datetime
+import warnings
+
 def rolling_mae(
     datasets: List[pd.DataFrame],
     frequency: str,
@@ -92,18 +98,6 @@ def rolling_mae(
             data[date_col] = pd.to_datetime(data[date_col])
             data = data.sort_values(date_col).reset_index(drop=True)
             
-            # Create quarter identifier for exclusions
-            data['quarter_id'] = data[date_col].dt.to_period('Q').astype(str).str.replace('Q', 'q').str.lower()
-            
-            # Filter out excluded quarters
-            excluded_periods = []
-            if excluded_quarters:
-                mask = ~data['quarter_id'].isin([q.lower() for q in excluded_quarters])
-                excluded_count = len(data) - mask.sum()
-                if excluded_count > 0:
-                    excluded_periods = data[~mask]['quarter_id'].unique().tolist()
-                    data = data[mask].reset_index(drop=True)
-            
             # Group data by time periods first, then calculate MAE per period
             if frequency.lower() == 'quarter':
                 data['period'] = data[date_col].dt.to_period('Q')
@@ -112,10 +106,14 @@ def rolling_mae(
             else:  # year
                 data['period'] = data[date_col].dt.to_period('Y')
             
+            # Create quarter identifier for later exclusions (but don't filter yet)
+            data['quarter_id'] = data[date_col].dt.to_period('Q').astype(str).str.replace('Q', 'q').str.lower()
+            
             # Group by period and calculate MEAN of actual and predicted values for each period
             period_groups = data.groupby('period').agg({
                 actual_col: 'mean',      # Mean actual for the period
-                predicted_col: 'mean'    # Mean predicted for the period
+                predicted_col: 'mean',   # Mean predicted for the period
+                'quarter_id': 'first'    # Keep quarter_id for exclusion logic
             }).reset_index()
             
             # Calculate absolute error for each period (comparing period means)
@@ -137,9 +135,25 @@ def rolling_mae(
                 warnings.warn(f"Dataset {idx} produced no valid rolling MAE values")
                 continue
             
-            # Calculate development metrics
-            development_mae = rolling_mae_clean.mean()
-            rolling_std = rolling_mae_clean.std()
+            # NOW apply quarter exclusions to the rolling results
+            excluded_periods = []
+            if excluded_quarters:
+                # Get the quarter_id for each rolling result period
+                rolling_df = rolling_mae_clean.reset_index()
+                rolling_df['quarter_id'] = rolling_df['period'].astype(str).str.replace('Q', 'q').str.lower()
+                
+                # Filter out excluded quarters from rolling results
+                excluded_mask = rolling_df['quarter_id'].isin([q.lower() for q in excluded_quarters])
+                excluded_periods = rolling_df[excluded_mask]['quarter_id'].unique().tolist()
+                
+                # Keep only non-excluded rolling values for final calculations
+                rolling_mae_final = rolling_df[~excluded_mask]['period_mae']
+            else:
+                rolling_mae_final = rolling_mae_clean
+            
+            # Calculate development metrics from the filtered rolling results
+            development_mae = rolling_mae_final.mean()
+            rolling_std = rolling_mae_final.std()
             
             # Calculate intervals - these are upper bounds for performance degradation
             warning_interval = development_mae + (1 * rolling_std)
@@ -150,10 +164,10 @@ def rolling_mae(
                 'development_mae': development_mae,
                 'warning_interval': warning_interval,
                 'breach_interval': breach_interval,
-                'rolling_mae_series': rolling_mae_clean,
+                'rolling_mae_series': rolling_mae_final,
                 'excluded_periods': excluded_periods,
                 'periods_used': len(period_groups),
-                'rolling_periods_calculated': len(rolling_mae_clean)
+                'rolling_periods_calculated': len(rolling_mae_final)
             }
             
         except Exception as e:
