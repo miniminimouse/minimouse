@@ -112,14 +112,13 @@ def rolling_mae(
             else:  # year
                 data['period'] = data[date_col].dt.to_period('Y')
             
-            # Group by period and calculate MAE for each period
-            # This aggregates all observations within each period
+            # Group by period and calculate MEAN of actual and predicted values for each period
             period_groups = data.groupby('period').agg({
-                actual_col: 'sum',      # Total actual for the period
-                predicted_col: 'sum'    # Total predicted for the period
+                actual_col: 'mean',      # Mean actual for the period
+                predicted_col: 'mean'    # Mean predicted for the period
             }).reset_index()
             
-            # Calculate MAE for each period (comparing period totals)
+            # Calculate absolute error for each period (comparing period means)
             period_groups['period_mae'] = np.abs(period_groups[actual_col] - period_groups[predicted_col])
             
             # Check if we have enough periods for rolling calculation
@@ -127,7 +126,7 @@ def rolling_mae(
                 warnings.warn(f"Dataset {idx} has insufficient periods ({len(period_groups)}) for rolling calculation of {rolling_periods} periods")
                 continue
             
-            # Create time series and apply rolling window
+            # Create time series and apply rolling window to period MAEs
             period_mae_series = period_groups.set_index('period')['period_mae']
             rolling_mae_series = period_mae_series.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
             
