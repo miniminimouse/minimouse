@@ -10,8 +10,8 @@ def rolling_mae(
     excluded_quarters: Optional[List[str]] = None,
     rolling_periods: int = 4,
     date_col: str = 'date',
-    actual_col: str = 'actual_var',
-    predicted_col: str = 'predicted_var'
+    column_mapping: Optional[Dict[int, Dict[str, str]]] = None,
+    all_cols: Optional[Dict[str, str]] = None
 ) -> Dict[int, Dict[str, Union[float, pd.Series]]]:
     """
     Calculate rolling MAE with warning and breach intervals for model validation.
@@ -32,10 +32,14 @@ def rolling_mae(
         Number of periods for rolling calculation (typically 4 quarters)
     date_col : str, default='date'
         Name of date column (format: "yyyy-mm-dd")
-    actual_col : str, default='actual_var'
-        Name of actual values column
-    predicted_col : str, default='predicted_var'
-        Name of predicted values column
+    column_mapping : Dict[int, Dict[str, str]], optional
+        Dataset-specific column mapping. Format:
+        {0: {'actual_col': 'actual_loss', 'predicted_col': 'pred_loss'},
+         1: {'actual_col': 'true_val', 'predicted_col': 'forecast'}}
+    all_cols : Dict[str, str], optional
+        Column names to use for all datasets. Format:
+        {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
+        Ignored if column_mapping is provided.
         
     Returns:
     --------
@@ -57,11 +61,26 @@ def rolling_mae(
     if rolling_periods < 1:
         raise ValueError("Rolling periods must be at least 1")
     
+    # Handle column mapping logic
+    if column_mapping is None and all_cols is None:
+        # Default fallback
+        all_cols = {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
+    
     excluded_quarters = excluded_quarters or []
     results = {}
     
     for idx, df in enumerate(datasets):
         try:
+            # Determine column names for this dataset
+            if column_mapping and idx in column_mapping:
+                actual_col = column_mapping[idx]['actual_col']
+                predicted_col = column_mapping[idx]['predicted_col']
+            elif all_cols:
+                actual_col = all_cols['actual_col']
+                predicted_col = all_cols['predicted_col']
+            else:
+                raise ValueError(f"No column mapping found for dataset {idx}")
+            
             # Basic validation
             if df.empty:
                 warnings.warn(f"Dataset {idx} is empty, skipping...")
@@ -192,10 +211,33 @@ if __name__ == "__main__":
         'predicted_var': predicted_vals
     })
     
-    # Test the function
-    test_results = rolling_mae(
+    # Test the function with different column mapping approaches
+    
+    # Method 1: Using all_cols for same column names across datasets
+    print("Testing with all_cols parameter:")
+    test_results1 = rolling_mae(
         datasets=[sample_data],
         frequency='quarter',
-        excluded_quarters=['1q2020', '2q2020'],  # Exclude COVID impact quarters
-        rolling_periods=4
+        excluded_quarters=['1q2020', '2q2020'],
+        rolling_periods=4,
+        all_cols={'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
+    )
+    
+    # Method 2: Using column_mapping for dataset-specific columns
+    print("\n" + "="*50)
+    print("Testing with column_mapping parameter:")
+    
+    # Create a second dataset with different column names
+    sample_data2 = sample_data.copy()
+    sample_data2.rename(columns={'actual_var': 'true_value', 'predicted_var': 'forecast'}, inplace=True)
+    
+    test_results2 = rolling_mae(
+        datasets=[sample_data, sample_data2],
+        frequency='quarter',
+        excluded_quarters=['1q2020', '2q2020'],
+        rolling_periods=4,
+        column_mapping={
+            0: {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'},
+            1: {'actual_col': 'true_value', 'predicted_col': 'forecast'}
+        }
     )
