@@ -1,447 +1,201 @@
-def twostage_lgd_scenario(model_results, train_data, test_data, 
-                         scenario_base, scenario_s3, scenario_s4,
-                         stage1_vars, stage2_vars, 
-                         id_var='loan_number', hist_date_var='def_date', fcst_date_var='fcst_date',
-                         lgd_var='lgd_36m',
-                         macro_vars_to_stress=None,
-                         loan_chars_to_analyze=['curr_fico', 'oltv'],
-                         loan_vars_to_stress=None,
-                         stress_direction='increase',  # 'increase' or 'decrease'
-                         stress_percentage=0.1):  # 10% stress by default
+import pandas as pd
+import numpy as np
+from typing import List, Dict, Optional, Tuple, Union
+from datetime import datetime
+import warnings
+
+def rolling_mae(
+    datasets: List[pd.DataFrame],
+    frequency: str,
+    excluded_quarters: Optional[List[str]] = None,
+    rolling_periods: int = 4,
+    date_col: str = 'date',
+    actual_col: str = 'actual_var',
+    predicted_col: str = 'predicted_var'
+) -> Dict[int, Dict[str, Union[float, pd.Series]]]:
     """
-    Scenario analysis for two-stage LGD model
-    Does forecasting, macro stress testing, and loan characteristic analysis
+    Calculate rolling MAE with warning and breach intervals for model validation.
+    
+    This function computes development MAE metrics used in banking model validation
+    frameworks like CCAR and CECL. It calculates rolling MAE over specified periods
+    and determines statistical thresholds for model performance monitoring.
+    
+    Parameters:
+    -----------
+    datasets : List[pd.DataFrame]
+        List of datasets to analyze. Each should contain date, actual, and predicted columns.
+    frequency : str
+        Data frequency - 'month', 'quarter', or 'year'
+    excluded_quarters : List[str], optional
+        Quarters to exclude in format "1q2008", "2q2009", etc.
+    rolling_periods : int, default=4
+        Number of periods for rolling calculation (typically 4 quarters)
+    date_col : str, default='date'
+        Name of date column (format: "yyyy-mm-dd")
+    actual_col : str, default='actual_var'
+        Name of actual values column
+    predicted_col : str, default='predicted_var'
+        Name of predicted values column
+        
+    Returns:
+    --------
+    Dict[int, Dict[str, Union[float, pd.Series]]]
+        Dictionary with dataset index as key, containing:
+        - 'development_mae': float - Average of rolling MAE
+        - 'warning_interval': float - Mean + 1 std dev
+        - 'breach_interval': float - Mean + 2 std dev
+        - 'rolling_mae_series': pd.Series - Complete rolling MAE time series
+        - 'excluded_periods': List[str] - Periods that were excluded
     """
     
+    if not datasets:
+        raise ValueError("At least one dataset must be provided")
+    
+    if frequency.lower() not in ['month', 'quarter', 'year']:
+        raise ValueError("Frequency must be 'month', 'quarter', or 'year'")
+    
+    if rolling_periods < 1:
+        raise ValueError("Rolling periods must be at least 1")
+    
+    excluded_quarters = excluded_quarters or []
     results = {}
     
-    # Get trained models
-    stage1_model = model_results['stage1_model']
-    stage2_model = model_results['stage2_model']
-    
-    print("=" * 80)
-    print("CATEGORY 1: FORECAST SCENARIOS")
-    print("=" * 80)
-    
-    # Score all three scenario datasets
-    scenarios = {
-        'Base': scenario_base,
-        'S3': scenario_s3, 
-        'S4': scenario_s4
-    }
-    
-    scored_scenarios = {}
-    aggregated_scenarios = {}
-    
-    for scenario_name, scenario_data in scenarios.items():
-        print(f"\nScoring {scenario_name} scenario...")
-        
-        # sort by loan number like in original function
-        scenario_sorted = scenario_data.sort_values(by=id_var).reset_index(drop=True)
-        
-        # Stage 1 scoring
-        stage1_X_const = sm.add_constant(scenario_sorted[stage1_vars])
-        stage1_probs = stage1_model.predict(stage1_X_const)
-        
-        # Stage 2 scoring  
-        stage2_X_const = sm.add_constant(scenario_sorted[stage2_vars])
-        stage2_probs = stage2_model.predict(stage2_X_const)
-        
-        # Combined predictions
-        scenario_sorted['p_loss'] = stage1_probs
-        scenario_sorted['p_lgd'] = stage2_probs
-        scenario_sorted['pred_lgd'] = stage1_probs * stage2_probs
-        
-        scored_scenarios[scenario_name] = scenario_sorted
-        
-        # Aggregate by forecast date
-        # For stage 1 - keep all data
-        stage1_agg = scenario_sorted.groupby(fcst_date_var).agg({
-            'p_loss': 'mean'
-        }).reset_index()
-        stage1_agg['scenario'] = scenario_name
-        
-        # For stage 2 - remove zeros from pred_lgd like original logic
-        stage2_filtered = scenario_sorted[scenario_sorted['pred_lgd'] > 0].copy()
-        stage2_agg = stage2_filtered.groupby(fcst_date_var).agg({
-            'p_lgd': 'mean'
-        }).reset_index()
-        stage2_agg['scenario'] = scenario_name
-        
-        # Combined - keep all data
-        combined_agg = scenario_sorted.groupby(fcst_date_var).agg({
-            'pred_lgd': 'mean'
-        }).reset_index()
-        combined_agg['scenario'] = scenario_name
-        
-        aggregated_scenarios[scenario_name] = {
-            'stage1': stage1_agg,
-            'stage2': stage2_agg, 
-            'combined': combined_agg
-        }
-    
-    results['scored_scenarios'] = scored_scenarios
-    results['aggregated_scenarios'] = aggregated_scenarios
-    
-    # Create scenario-only plots
-    print("\nCreating scenario forecast plots...")
-    
-    stages = ['stage1', 'stage2', 'combined']
-    y_vars = ['p_loss', 'p_lgd', 'pred_lgd']
-    titles = ['Stage-1 Probability of Loss', 'Stage-2 E(LGD|Loss)', 'Combined LGD Forecast']
-    
-    for i, stage in enumerate(stages):
-        plt.figure(figsize=(12, 8))
-        
-        for scenario_name in scenarios.keys():
-            agg_data = aggregated_scenarios[scenario_name][stage]
-            plt.plot(pd.to_datetime(agg_data[fcst_date_var]), agg_data[y_vars[i]], 
-                    label=f'{scenario_name}', linewidth=2, marker='o', markersize=4)
-        
-        plt.xlabel('Forecast Date', fontsize=10)
-        plt.ylabel('LGD Level', fontsize=10) 
-        plt.title(f'{titles[i]} - Scenario Forecasts', fontsize=14)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-    
-    # Create combined plots with historical data
-    print("\nCreating combined historical + scenario plots...")
-    
-    # Get historical aggregated data from model results
-    hist_metrics = model_results['metrics']
-    
-    for i, stage in enumerate(stages):
-        plt.figure(figsize=(15, 8))
-        
-        # Plot historical data
-        if stage == 'stage1':
-            hist_data = hist_metrics['stage1_hist']['aggregated_data']
-            oot_data = hist_metrics['stage1_oot']['aggregated_data']
-            actual_var = 'lgd_stage1'
-            pred_var = 'p_loss'
-        elif stage == 'stage2':
-            hist_data = hist_metrics['stage2_hist']['aggregated_data'] 
-            oot_data = hist_metrics['stage2_oot']['aggregated_data']
-            actual_var = lgd_var
-            pred_var = 'p_lgd'
-        else:  # combined
-            hist_data = hist_metrics['combined_hist']['aggregated_data']
-            oot_data = hist_metrics['combined_oot']['aggregated_data']
-            actual_var = lgd_var
-            pred_var = 'pred_lgd'
-        
-        # Historical lines
-        if hist_data is not None:
-            plt.plot(pd.to_datetime(hist_data[hist_date_var]), hist_data[actual_var], 
-                    label='Actual HIST', linewidth=2, color='blue', marker='o', markersize=4)
-            plt.plot(pd.to_datetime(hist_data[hist_date_var]), hist_data[pred_var],
-                    label='Predicted HIST', linewidth=2, color='red', marker='s', markersize=4)
-        
-        # OOT lines  
-        if oot_data is not None:
-            plt.plot(pd.to_datetime(oot_data[hist_date_var]), oot_data[actual_var],
-                    label='Actual OOT', linewidth=2, color='darkblue', linestyle='--', marker='o', markersize=4)
-            plt.plot(pd.to_datetime(oot_data[hist_date_var]), oot_data[pred_var],
-                    label='Predicted OOT', linewidth=2, color='darkred', linestyle='--', marker='s', markersize=4)
-        
-        # Scenario lines
-        colors = ['green', 'orange', 'purple']
-        for j, scenario_name in enumerate(scenarios.keys()):
-            agg_data = aggregated_scenarios[scenario_name][stage]
-            plt.plot(pd.to_datetime(agg_data[fcst_date_var]), agg_data[y_vars[i]],
-                    label=f'{scenario_name} Forecast', linewidth=2, color=colors[j], 
-                    linestyle=':', marker='^', markersize=4)
-        
-        plt.xlabel('Date', fontsize=10)
-        plt.ylabel('LGD Level', fontsize=10)
-        plt.title(f'{titles[i]} - Historical vs Forecast Scenarios', fontsize=14)
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-    
-    # CATEGORY 2: BEHAVIOR OF STRESSED MACRO VARIABLES
-    print("\n" + "=" * 80)
-    print("CATEGORY 2: BEHAVIOR OF STRESSED MACRO VARIABLES")
-    print("=" * 80)
-    
-    if macro_vars_to_stress:
-        # Combine historical data
-        hist_combined = pd.concat([train_data, test_data], ignore_index=True)
-        
-        for macro_var in macro_vars_to_stress:
-            if macro_var in hist_combined.columns:
-                print(f"\nPlotting {macro_var} stress behavior...")
+    for idx, df in enumerate(datasets):
+        try:
+            # Basic validation
+            if df.empty:
+                warnings.warn(f"Dataset {idx} is empty, skipping...")
+                continue
                 
-                plt.figure(figsize=(12, 8))
-                
-                # Historical monthly averages
-                hist_combined[hist_date_var] = pd.to_datetime(hist_combined[hist_date_var])
-                hist_monthly = hist_combined.groupby(hist_combined[hist_date_var].dt.to_period('M')).agg({
-                    macro_var: 'mean'
-                }).reset_index()
-                hist_monthly[hist_date_var] = hist_monthly[hist_date_var].dt.to_timestamp()
-                
-                plt.plot(hist_monthly[hist_date_var], hist_monthly[macro_var], 
-                        label='Historical', linewidth=2, color='black')
-                
-                # Scenario levels
-                colors = ['green', 'orange', 'purple']
-                for j, (scenario_name, scenario_data) in enumerate(scenarios.items()):
-                    if macro_var in scenario_data.columns:
-                        scenario_monthly = scenario_data.groupby(fcst_date_var).agg({
-                            macro_var: 'mean'
-                        }).reset_index()
-                        
-                        plt.plot(pd.to_datetime(scenario_monthly[fcst_date_var]), 
-                                scenario_monthly[macro_var],
-                                label=f'{scenario_name}', linewidth=2, color=colors[j], 
-                                linestyle='--', marker='o', markersize=4)
-                
-                plt.xlabel('Date', fontsize=10)
-                plt.ylabel(f'{macro_var}', fontsize=10)
-                plt.title(f'{macro_var} - Historical vs Stress Scenarios', fontsize=14)
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.show()
-    
-    # CATEGORY 3: BALANCE DECOMPOSITION OF KEY LOAN CHARACTERISTICS  
-    print("\n" + "=" * 80)
-    print("CATEGORY 3: BALANCE DECOMPOSITION OF KEY LOAN CHARACTERISTICS")
-    print("=" * 80)
-    
-    # Combine historical data and filter for June data only
-    hist_combined = pd.concat([train_data, test_data], ignore_index=True)
-    hist_combined[hist_date_var] = pd.to_datetime(hist_combined[hist_date_var])
-    june_data = hist_combined[hist_combined[hist_date_var].dt.strftime('%m-%d') == '06-30'].copy()
-    june_data['year'] = june_data[hist_date_var].dt.year
-    
-    for loan_char in loan_chars_to_analyze:
-        if loan_char in june_data.columns:
-            print(f"\nCreating decomposition for {loan_char}...")
+            required_cols = [date_col, actual_col, predicted_col]
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f"Dataset {idx} missing columns: {missing_cols}")
             
-            # Define bins
-            if loan_char == 'curr_fico':
-                bins = [-np.inf, 600, 660, 700, 740, np.inf]
-                labels = ['≤600', '601-660', '661-700', '701-740', '≥741']
-            elif loan_char == 'oltv':
-                bins = [-np.inf, 0.5, 0.7, 0.8, 0.9, np.inf]
-                labels = ['<0.5', '0.5-0.7', '0.7-0.8', '0.8-0.9', '>0.9']
-            else:
-                continue  # skip if not predefined
+            # Work with a copy to avoid modifying original
+            data = df.copy()
             
-            # Create bins
-            june_data[f'{loan_char}_bin'] = pd.cut(june_data[loan_char], 
-                                                  bins=bins, labels=labels, include_lowest=True)
+            # Ensure date column is datetime
+            data[date_col] = pd.to_datetime(data[date_col])
+            data = data.sort_values(date_col).reset_index(drop=True)
             
-            # Handle missing values
-            june_data[f'{loan_char}_bin'] = june_data[f'{loan_char}_bin'].cat.add_categories(['Missing'])
-            june_data[f'{loan_char}_bin'].fillna('Missing', inplace=True)
+            # Create quarter identifier for exclusions
+            data['quarter_id'] = data[date_col].dt.to_period('Q').astype(str).str.replace('Q', 'q').str.lower()
             
-            # Calculate percentages by year
-            yearly_dist = june_data.groupby(['year', f'{loan_char}_bin']).size().unstack(fill_value=0)
-            yearly_pct = yearly_dist.div(yearly_dist.sum(axis=1), axis=0) * 100
+            # Filter out excluded quarters
+            excluded_periods = []
+            if excluded_quarters:
+                mask = ~data['quarter_id'].isin([q.lower() for q in excluded_quarters])
+                excluded_count = len(data) - mask.sum()
+                if excluded_count > 0:
+                    excluded_periods = data[~mask]['quarter_id'].unique().tolist()
+                    data = data[mask].reset_index(drop=True)
             
-            # Create stacked bar plot
-            plt.figure(figsize=(14, 8))
-            yearly_pct.plot(kind='bar', stacked=True, figsize=(14, 8))
-            plt.xlabel('Year', fontsize=10)
-            plt.ylabel('Percentage of Loans', fontsize=10)
-            plt.title(f'{loan_char} Distribution by Year (June Data)', fontsize=14)
-            plt.legend(title=f'{loan_char} Bins', bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            plt.show()
-    
-    # CATEGORY 4: COMPARING JUNE 2007 VS JUNE 2024 LEVELS
-    print("\n" + "=" * 80) 
-    print("CATEGORY 4: COMPARING JUNE 2007 VS JUNE 2024 LEVELS")
-    print("=" * 80)
-    
-    # Get June 2007 data
-    june_2007 = hist_combined[hist_combined[hist_date_var] == '2007-06-30'].copy()
-    
-    # Get June 2024 data (loan-level averages from scenario_base)
-    june_2024 = scenario_base.groupby(id_var)[loan_chars_to_analyze].mean().reset_index()
-    
-    for loan_char in loan_chars_to_analyze:
-        if loan_char in june_2007.columns and loan_char in june_2024.columns:
-            print(f"\nComparing {loan_char}: June 2007 vs June 2024...")
-            
-            # Define bins (same as category 3)
-            if loan_char == 'curr_fico':
-                bins = [-np.inf, 600, 660, 700, 740, np.inf]
-                labels = ['≤600', '601-660', '661-700', '701-740', '≥741']
-            elif loan_char == 'oltv':
-                bins = [-np.inf, 0.5, 0.7, 0.8, 0.9, np.inf]
-                labels = ['<0.5', '0.5-0.7', '0.7-0.8', '0.8-0.9', '>0.9']
-            else:
+            if len(data) < rolling_periods:
+                warnings.warn(f"Dataset {idx} has insufficient data points ({len(data)}) for rolling calculation of {rolling_periods} periods")
                 continue
             
-            # Bin both datasets
-            june_2007[f'{loan_char}_bin'] = pd.cut(june_2007[loan_char], 
-                                                  bins=bins, labels=labels, include_lowest=True)
-            june_2024[f'{loan_char}_bin'] = pd.cut(june_2024[loan_char], 
-                                                  bins=bins, labels=labels, include_lowest=True)
+            # Calculate MAE for each period
+            data['mae'] = np.abs(data[actual_col] - data[predicted_col])
             
-            # Handle missing values
-            for df in [june_2007, june_2024]:
-                df[f'{loan_char}_bin'] = df[f'{loan_char}_bin'].cat.add_categories(['Missing'])
-                df[f'{loan_char}_bin'].fillna('Missing', inplace=True)
+            # Handle different frequencies for rolling calculation
+            if frequency.lower() == 'quarter':
+                # Group by quarter and calculate mean MAE per quarter
+                data['period'] = data[date_col].dt.to_period('Q')
+                quarterly_mae = data.groupby('period')['mae'].mean()
+                rolling_mae_series = quarterly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
+            elif frequency.lower() == 'month':
+                # Group by month
+                data['period'] = data[date_col].dt.to_period('M')
+                monthly_mae = data.groupby('period')['mae'].mean()
+                rolling_mae_series = monthly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
+            else:  # year
+                # Group by year
+                data['period'] = data[date_col].dt.to_period('Y')
+                yearly_mae = data.groupby('period')['mae'].mean()
+                rolling_mae_series = yearly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
             
-            # Calculate percentages
-            dist_2007 = june_2007[f'{loan_char}_bin'].value_counts(normalize=True) * 100
-            dist_2024 = june_2024[f'{loan_char}_bin'].value_counts(normalize=True) * 100
+            # Remove NaN values from rolling calculation
+            rolling_mae_clean = rolling_mae_series.dropna()
             
-            # Combine for plotting
-            comparison_df = pd.DataFrame({
-                'June 2007': dist_2007,
-                'June 2024': dist_2024
-            }).fillna(0)
+            if len(rolling_mae_clean) == 0:
+                warnings.warn(f"Dataset {idx} produced no valid rolling MAE values")
+                continue
             
-            # Create comparative bar plot
-            plt.figure(figsize=(12, 8))
-            comparison_df.plot(kind='bar', figsize=(12, 8))
-            plt.xlabel(f'{loan_char} Bins', fontsize=10)
-            plt.ylabel('Percentage of Loans', fontsize=10)
-            plt.title(f'{loan_char} Distribution: June 2007 vs June 2024', fontsize=14)
-            plt.legend()
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            plt.show()
-    
-    # CATEGORY 5: STRESS TESTING KEY LOAN CHARACTERISTICS
-    print("\n" + "=" * 80)
-    print("CATEGORY 5: STRESS TESTING KEY LOAN CHARACTERISTICS") 
-    print("=" * 80)
-    
-    if loan_vars_to_stress:
-        print(f"\nApplying {stress_percentage*100}% {stress_direction} stress to: {loan_vars_to_stress}")
-        
-        # Create stressed scenario datasets
-        stressed_scenarios = {}
-        
-        for scenario_name, scenario_data in scenarios.items():
-            stressed_data = scenario_data.copy()
+            # Calculate development metrics
+            development_mae = rolling_mae_clean.mean()
+            rolling_std = rolling_mae_clean.std()
             
-            for stress_var in loan_vars_to_stress:
-                if stress_var in stressed_data.columns:
-                    if stress_direction == 'increase':
-                        stressed_data[stress_var] = stressed_data[stress_var] * (1 + stress_percentage)
-                    else:  # decrease
-                        stressed_data[stress_var] = stressed_data[stress_var] * (1 - stress_percentage)
+            # Calculate intervals - these are upper bounds for performance degradation
+            warning_interval = development_mae + (1 * rolling_std)
+            breach_interval = development_mae + (2 * rolling_std)
             
-            stressed_scenarios[f'{scenario_name}_Stressed'] = stressed_data
-        
-        # Score stressed scenarios
-        stressed_aggregated = {}
-        
-        for scenario_name, scenario_data in stressed_scenarios.items():
-            # Sort by loan number
-            scenario_sorted = scenario_data.sort_values(by=id_var).reset_index(drop=True)
-            
-            # Stage 1 scoring
-            stage1_X_const = sm.add_constant(scenario_sorted[stage1_vars])
-            stage1_probs = stage1_model.predict(stage1_X_const)
-            
-            # Stage 2 scoring
-            stage2_X_const = sm.add_constant(scenario_sorted[stage2_vars])
-            stage2_probs = stage2_model.predict(stage2_X_const)
-            
-            # Combined predictions
-            scenario_sorted['p_loss'] = stage1_probs
-            scenario_sorted['p_lgd'] = stage2_probs
-            scenario_sorted['pred_lgd'] = stage1_probs * stage2_probs
-            
-            # Aggregate by forecast date (same logic as before)
-            stage1_agg = scenario_sorted.groupby(fcst_date_var).agg({
-                'p_loss': 'mean'
-            }).reset_index()
-            stage1_agg['scenario'] = scenario_name
-            
-            stage2_filtered = scenario_sorted[scenario_sorted['pred_lgd'] > 0].copy()
-            stage2_agg = stage2_filtered.groupby(fcst_date_var).agg({
-                'p_lgd': 'mean'
-            }).reset_index()
-            stage2_agg['scenario'] = scenario_name
-            
-            combined_agg = scenario_sorted.groupby(fcst_date_var).agg({
-                'pred_lgd': 'mean'
-            }).reset_index()
-            combined_agg['scenario'] = scenario_name
-            
-            stressed_aggregated[scenario_name] = {
-                'stage1': stage1_agg,
-                'stage2': stage2_agg,
-                'combined': combined_agg
+            # Store results
+            results[idx] = {
+                'development_mae': development_mae,
+                'warning_interval': warning_interval,
+                'breach_interval': breach_interval,
+                'rolling_mae_series': rolling_mae_clean,
+                'excluded_periods': excluded_periods,
+                'data_points_used': len(data),
+                'rolling_periods_calculated': len(rolling_mae_clean)
             }
-        
-        # Create stressed plots (with historical + original scenarios + stressed scenarios)
-        print("\nCreating stressed characteristic plots...")
-        
-        for i, stage in enumerate(stages):
-            plt.figure(figsize=(16, 8))
             
-            # Plot historical data (same as before)
-            if stage == 'stage1':
-                hist_data = hist_metrics['stage1_hist']['aggregated_data']
-                oot_data = hist_metrics['stage1_oot']['aggregated_data']
-                actual_var = 'lgd_stage1'
-                pred_var = 'p_loss'
-            elif stage == 'stage2':
-                hist_data = hist_metrics['stage2_hist']['aggregated_data']
-                oot_data = hist_metrics['stage2_oot']['aggregated_data']
-                actual_var = lgd_var
-                pred_var = 'p_lgd'
-            else:  # combined
-                hist_data = hist_metrics['combined_hist']['aggregated_data']
-                oot_data = hist_metrics['combined_oot']['aggregated_data']
-                actual_var = lgd_var
-                pred_var = 'pred_lgd'
-            
-            # Historical lines
-            if hist_data is not None:
-                plt.plot(pd.to_datetime(hist_data[hist_date_var]), hist_data[actual_var],
-                        label='Actual HIST', linewidth=2, color='blue', marker='o', markersize=4)
-                plt.plot(pd.to_datetime(hist_data[hist_date_var]), hist_data[pred_var],
-                        label='Predicted HIST', linewidth=2, color='red', marker='s', markersize=4)
-            
-            # OOT lines
-            if oot_data is not None:
-                plt.plot(pd.to_datetime(oot_data[hist_date_var]), oot_data[actual_var],
-                        label='Actual OOT', linewidth=2, color='darkblue', linestyle='--', marker='o', markersize=4)
-                plt.plot(pd.to_datetime(oot_data[hist_date_var]), oot_data[pred_var],
-                        label='Predicted OOT', linewidth=2, color='darkred', linestyle='--', marker='s', markersize=4)
-            
-            # Original scenario lines
-            colors = ['green', 'orange', 'purple']
-            for j, scenario_name in enumerate(scenarios.keys()):
-                agg_data = aggregated_scenarios[scenario_name][stage]
-                plt.plot(pd.to_datetime(agg_data[fcst_date_var]), agg_data[y_vars[i]],
-                        label=f'{scenario_name}', linewidth=2, color=colors[j],
-                        linestyle=':', marker='^', markersize=4)
-            
-            # Stressed scenario lines
-            stressed_colors = ['lightgreen', 'moccasin', 'plum']
-            for j, scenario_name in enumerate(stressed_scenarios.keys()):
-                agg_data = stressed_aggregated[scenario_name][stage]
-                plt.plot(pd.to_datetime(agg_data[fcst_date_var]), agg_data[y_vars[i]],
-                        label=f'{scenario_name}', linewidth=2, color=stressed_colors[j % 3],
-                        linestyle='-.', marker='v', markersize=4)
-            
-            plt.xlabel('Date', fontsize=10)
-            plt.ylabel('LGD Level', fontsize=10)
-            plt.title(f'{titles[i]} - With Stressed Loan Characteristics', fontsize=14)
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.show()
-        
-        results['stressed_scenarios'] = stressed_scenarios
-        results['stressed_aggregated'] = stressed_aggregated
+        except Exception as e:
+            warnings.warn(f"Error processing dataset {idx}: {str(e)}")
+            continue
     
-    print("\nScenario analysis complete!")
+    # Print results automatically
+    if results:
+        print("=" * 70)
+        print("ROLLING MAE VALIDATION RESULTS")
+        print("=" * 70)
+        
+        for dataset_idx, metrics in results.items():
+            dev_mae = metrics['development_mae']
+            warn_thresh = metrics['warning_interval']
+            breach_thresh = metrics['breach_interval']
+            
+            print(f"\nDataset {dataset_idx}:")
+            print(f"  Development MAE: {dev_mae:.6f}")
+            print(f"  Good interval: MAE < {warn_thresh:.6f}")
+            print(f"  Warning: {warn_thresh:.6f} <= MAE < {breach_thresh:.6f}")
+            print(f"  Breach: MAE >= {breach_thresh:.6f}")
+            print(f"  Data points used: {metrics['data_points_used']}")
+            print(f"  Rolling calculations: {metrics['rolling_periods_calculated']}")
+            
+            if metrics['excluded_periods']:
+                print(f"  Excluded periods: {', '.join(metrics['excluded_periods'])}")
+    else:
+        print("No valid results to display - check your data and parameters")
+    
     return results
+
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Generate sample data for testing
+    np.random.seed(42)
+    
+    # Create sample dataset
+    dates = pd.date_range('2020-01-31', '2023-12-31', freq='M')
+    n_points = len(dates)
+    
+    # Simulate actual and predicted values with some realistic noise
+    actual_vals = 100 + np.cumsum(np.random.normal(0, 5, n_points))
+    predicted_vals = actual_vals + np.random.normal(0, 3, n_points)  # Some prediction error
+    
+    sample_data = pd.DataFrame({
+        'date': dates,
+        'actual_var': actual_vals,
+        'predicted_var': predicted_vals
+    })
+    
+    # Test the function
+    test_results = rolling_mae(
+        datasets=[sample_data],
+        frequency='quarter',
+        excluded_quarters=['1q2020', '2q2020'],  # Exclude COVID impact quarters
+        rolling_periods=4
+    )
