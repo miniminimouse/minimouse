@@ -1,9 +1,3 @@
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Optional, Tuple, Union
-from datetime import datetime
-import warnings
-
 def rolling_mae(
     datasets: List[pd.DataFrame],
     frequency: str,
@@ -110,29 +104,32 @@ def rolling_mae(
                     excluded_periods = data[~mask]['quarter_id'].unique().tolist()
                     data = data[mask].reset_index(drop=True)
             
-            if len(data) < rolling_periods:
-                warnings.warn(f"Dataset {idx} has insufficient data points ({len(data)}) for rolling calculation of {rolling_periods} periods")
+            # Group data by time periods first, then calculate MAE per period
+            if frequency.lower() == 'quarter':
+                data['period'] = data[date_col].dt.to_period('Q')
+            elif frequency.lower() == 'month':
+                data['period'] = data[date_col].dt.to_period('M')
+            else:  # year
+                data['period'] = data[date_col].dt.to_period('Y')
+            
+            # Group by period and calculate MAE for each period
+            # This aggregates all observations within each period
+            period_groups = data.groupby('period').agg({
+                actual_col: 'sum',      # Total actual for the period
+                predicted_col: 'sum'    # Total predicted for the period
+            }).reset_index()
+            
+            # Calculate MAE for each period (comparing period totals)
+            period_groups['period_mae'] = np.abs(period_groups[actual_col] - period_groups[predicted_col])
+            
+            # Check if we have enough periods for rolling calculation
+            if len(period_groups) < rolling_periods:
+                warnings.warn(f"Dataset {idx} has insufficient periods ({len(period_groups)}) for rolling calculation of {rolling_periods} periods")
                 continue
             
-            # Calculate MAE for each period
-            data['mae'] = np.abs(data[actual_col] - data[predicted_col])
-            
-            # Handle different frequencies for rolling calculation
-            if frequency.lower() == 'quarter':
-                # Group by quarter and calculate mean MAE per quarter
-                data['period'] = data[date_col].dt.to_period('Q')
-                quarterly_mae = data.groupby('period')['mae'].mean()
-                rolling_mae_series = quarterly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
-            elif frequency.lower() == 'month':
-                # Group by month
-                data['period'] = data[date_col].dt.to_period('M')
-                monthly_mae = data.groupby('period')['mae'].mean()
-                rolling_mae_series = monthly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
-            else:  # year
-                # Group by year
-                data['period'] = data[date_col].dt.to_period('Y')
-                yearly_mae = data.groupby('period')['mae'].mean()
-                rolling_mae_series = yearly_mae.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
+            # Create time series and apply rolling window
+            period_mae_series = period_groups.set_index('period')['period_mae']
+            rolling_mae_series = period_mae_series.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
             
             # Remove NaN values from rolling calculation
             rolling_mae_clean = rolling_mae_series.dropna()
@@ -156,7 +153,7 @@ def rolling_mae(
                 'breach_interval': breach_interval,
                 'rolling_mae_series': rolling_mae_clean,
                 'excluded_periods': excluded_periods,
-                'data_points_used': len(data),
+                'periods_used': len(period_groups),
                 'rolling_periods_calculated': len(rolling_mae_clean)
             }
             
@@ -180,7 +177,7 @@ def rolling_mae(
             print(f"  Good interval: MAE < {warn_thresh:.6f}")
             print(f"  Warning: {warn_thresh:.6f} <= MAE < {breach_thresh:.6f}")
             print(f"  Breach: MAE >= {breach_thresh:.6f}")
-            print(f"  Data points used: {metrics['data_points_used']}")
+            print(f"  Data points used: {metrics['periods_used']}")
             print(f"  Rolling calculations: {metrics['rolling_periods_calculated']}")
             
             if metrics['excluded_periods']:
@@ -189,55 +186,3 @@ def rolling_mae(
         print("No valid results to display - check your data and parameters")
     
     return results
-
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Generate sample data for testing
-    np.random.seed(42)
-    
-    # Create sample dataset
-    dates = pd.date_range('2020-01-31', '2023-12-31', freq='M')
-    n_points = len(dates)
-    
-    # Simulate actual and predicted values with some realistic noise
-    actual_vals = 100 + np.cumsum(np.random.normal(0, 5, n_points))
-    predicted_vals = actual_vals + np.random.normal(0, 3, n_points)  # Some prediction error
-    
-    sample_data = pd.DataFrame({
-        'date': dates,
-        'actual_var': actual_vals,
-        'predicted_var': predicted_vals
-    })
-    
-    # Test the function with different column mapping approaches
-    
-    # Method 1: Using all_cols for same column names across datasets
-    print("Testing with all_cols parameter:")
-    test_results1 = rolling_mae(
-        datasets=[sample_data],
-        frequency='quarter',
-        excluded_quarters=['1q2020', '2q2020'],
-        rolling_periods=4,
-        all_cols={'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
-    )
-    
-    # Method 2: Using column_mapping for dataset-specific columns
-    print("\n" + "="*50)
-    print("Testing with column_mapping parameter:")
-    
-    # Create a second dataset with different column names
-    sample_data2 = sample_data.copy()
-    sample_data2.rename(columns={'actual_var': 'true_value', 'predicted_var': 'forecast'}, inplace=True)
-    
-    test_results2 = rolling_mae(
-        datasets=[sample_data, sample_data2],
-        frequency='quarter',
-        excluded_quarters=['1q2020', '2q2020'],
-        rolling_periods=4,
-        column_mapping={
-            0: {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'},
-            1: {'actual_col': 'true_value', 'predicted_col': 'forecast'}
-        }
-    )
