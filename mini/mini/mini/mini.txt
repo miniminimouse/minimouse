@@ -47,11 +47,38 @@ quit;
         set temp_baseline temp_oot;
     run;
     
-    /* create bins using proc rank on combined data */
-    proc rank data=temp_combined out=temp_ranked groups=&n_bins;
-        var &current_var;
-        ranks bin_number;
-    run;
+    /* create bins - either quantile or equal width */
+    %if %upcase(&bin_method) = QUANTILE %then %do;
+        /* use proc rank for quantile bins */
+        proc rank data=temp_combined out=temp_ranked groups=&n_bins;
+            var &current_var;
+            ranks bin_number;
+        run;
+    %end;
+    %else %if %upcase(&bin_method) = EQUAL_WIDTH %then %do;
+        /* calculate equal width bins manually */
+        proc sql noprint;
+            select min(&current_var), max(&current_var) 
+            into :var_min, :var_max
+            from temp_combined;
+        quit;
+        
+        data temp_ranked;
+            set temp_combined;
+            bin_width = (&var_max - &var_min) / &n_bins;
+            
+            /* assign bin number based on equal width intervals */
+            if &current_var = &var_min then bin_number = 0;
+            else bin_number = floor((&current_var - &var_min) / bin_width);
+            
+            /* make sure we don't exceed max bins */
+            if bin_number >= &n_bins then bin_number = &n_bins - 1;
+        run;
+    %end;
+    %else %do;
+        %put ERROR: bin_method must be either QUANTILE or EQUAL_WIDTH;
+        %goto next_var;
+    %end;
     
     /* now get frequencies by dataset and bin */
     proc freq data=temp_ranked noprint;
