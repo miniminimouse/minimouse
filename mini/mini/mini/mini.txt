@@ -8,10 +8,6 @@
     print_results=Y
 );
 
-/*
-simple psi calculation - no fancy stuff that breaks
-*/
-
 %local i var_count current_var;
 
 proc datasets lib=&output_lib nolist;
@@ -179,6 +175,8 @@ quit;
         %put   PSI Value: &total_psi;
         %put   Risk Level: &interpretation;
     %end;
+    
+    %next_var:
     
 %end;
 
