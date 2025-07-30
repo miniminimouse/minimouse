@@ -1,167 +1,288 @@
-def get_psi(
-    baseline_data: pd.DataFrame,
-    oot_data: pd.DataFrame,
-    variables: List[str],
-    n_bins: int = 10,
-    bin_method: str = 'quantile',
-    min_bin_pct: float = 0.05
-) -> Dict[str, Dict]:
-    """
-    Calculate Population Stability Index (PSI) for detecting distribution shifts.
+%macro get_psi(
+    baseline_data=,
+    oot_data=,
+    variables=,
+    n_bins=10,
+    bin_method=quantile,
+    output_lib=work,
+    print_results=Y
+);
+
+/*
+Population Stability Index calculation
+Compares distributions between baseline and OOT samples
+*/
+
+%local i var_count current_var;
+
+/* clean up from previous runs */
+proc datasets lib=&output_lib nolist;
+    delete psi_: temp_:;
+quit;
+
+/* count variables in the list */
+%let var_count = %sysfunc(countw(&variables, %str( )));
+
+%if &print_results = Y %then %do;
+    %put ==========================================================;
+    %put POPULATION STABILITY INDEX RESULTS;
+    %put ==========================================================;
+%end;
+
+/* loop through each variable */
+%do i = 1 %to &var_count;
+    %let current_var = %scan(&variables, &i, %str( ));
     
-    PSI measures how much a variable's distribution has shifted between two samples.
-    Used heavily in banking for model monitoring and validation.
+    /* check if variable exists in both datasets */
+    %let baseline_exists = 0;
+    %let oot_exists = 0;
     
-    Parameters:
-    -----------
-    baseline_data : pd.DataFrame
-        Reference dataset (usually development/training sample)
-    oot_data : pd.DataFrame  
-        Out-of-time validation dataset
-    variables : List[str]
-        List of variable names to calculate PSI for
-    n_bins : int, default=10
-        Number of bins for discretization
-    bin_method : str, default='quantile'
-        Binning method: 'quantile' or 'equal_width'
-    min_bin_pct : float, default=0.05
-        Minimum percentage threshold for bin adjustments
+    proc contents data=&baseline_data out=temp_baseline_cols(keep=name) noprint;
+    run;
+    
+    proc contents data=&oot_data out=temp_oot_cols(keep=name) noprint;
+    run;
+    
+    /* verify variable exists in baseline */
+    proc sql noprint;
+        select count(*) into :baseline_exists
+        from temp_baseline_cols
+        where upcase(name) = upcase("&current_var");
+    quit;
+    
+    /* verify variable exists in oot */
+    proc sql noprint;
+        select count(*) into :oot_exists  
+        from temp_oot_cols
+        where upcase(name) = upcase("&current_var");
+    quit;
+    
+    %if &baseline_exists = 0 or &oot_exists = 0 %then %do;
+        %put WARNING: Variable &current_var not found in one or both datasets;
+        %goto next_var;
+    %end;
+    
+    /* create working datasets with non-missing values only */
+    data temp_baseline_&i;
+        set &baseline_data(keep=&current_var);
+        where not missing(&current_var);
+        dataset_type = 'baseline';
+    run;
+    
+    data temp_oot_&i;
+        set &oot_data(keep=&current_var);  
+        where not missing(&current_var);
+        dataset_type = 'oot';
+    run;
+    
+    /* get basic stats for context */
+    proc means data=temp_baseline_&i noprint;
+        var &current_var;
+        output out=baseline_stats_&i n=baseline_n mean=baseline_mean 
+               std=baseline_std min=baseline_min max=baseline_max;
+    run;
+    
+    proc means data=temp_oot_&i noprint;
+        var &current_var;
+        output out=oot_stats_&i n=oot_n mean=oot_mean 
+               std=oot_std min=oot_min max=oot_max;
+    run;
+    
+    /* determine bin edges based on baseline distribution */
+    %if %upcase(&bin_method) = QUANTILE %then %do;
+        proc univariate data=temp_baseline_&i noprint;
+            var &current_var;
+            output out=temp_percentiles_&i
+                pctlpts = %do j=0 %to &n_bins; %eval(100*&j/&n_bins) %end;
+                pctlpre = p;
+        run;
         
-    Returns:
-    --------
-    Dict[str, Dict]
-        Dictionary with variable names as keys, containing:
-        - 'psi_value': float - Overall PSI score
-        - 'interpretation': str - Risk level interpretation  
-        - 'bin_analysis': pd.DataFrame - Detailed bin-level breakdown
-        - 'baseline_stats': Dict - Baseline distribution stats
-        - 'oot_stats': Dict - OOT distribution stats
-    """
+        /* create macro variables for bin edges */
+        data _null_;
+            set temp_percentiles_&i;
+            %do j=0 %to &n_bins;
+                call symputx("bin_edge_&j", p%eval(100*&j/&n_bins));
+            %end;
+        run;
+    %end;
+    %else %do;
+        /* equal width bins */
+        proc sql noprint;
+            select min(&current_var), max(&current_var) 
+            into :var_min, :var_max
+            from temp_baseline_&i;
+        quit;
+        
+        %do j=0 %to &n_bins;
+            %let bin_edge_&j = %sysevalf(&var_min + (&var_max - &var_min) * &j / &n_bins);
+        %end;
+    %end;
     
-    if baseline_data.empty or oot_data.empty:
-        raise ValueError("Both datasets must contain data")
+    /* apply binning to both datasets */
+    data temp_combined_&i;
+        set temp_baseline_&i temp_oot_&i;
+        
+        /* assign bins based on calculated edges */
+        %do j=1 %to &n_bins;
+            %if &j = 1 %then %do;
+                if &current_var <= &&bin_edge_&j then bin_number = &j;
+            %end;
+            %else %if &j = &n_bins %then %do;
+                else if &current_var <= &&bin_edge_&j then bin_number = &j;
+            %end;
+            %else %do;
+                else if &current_var <= &&bin_edge_&j then bin_number = &j;
+            %end;
+        %end;
+        
+        /* handle edge cases */
+        if missing(bin_number) then bin_number = &n_bins;
+    run;
     
-    # check variables exist in both datasets
-    missing_baseline = [var for var in variables if var not in baseline_data.columns]
-    missing_oot = [var for var in variables if var not in oot_data.columns]
+    /* calculate distributions for each dataset */
+    proc freq data=temp_combined_&i noprint;
+        tables dataset_type * bin_number / out=temp_freq_&i outpct;
+    run;
     
-    if missing_baseline:
-        raise ValueError(f"Variables missing from baseline data: {missing_baseline}")
-    if missing_oot:
-        raise ValueError(f"Variables missing from OOT data: {missing_oot}")
+    /* reshape to get baseline and oot percentages side by side */
+    proc transpose data=temp_freq_&i out=temp_baseline_pct_&i(drop=_name_)
+                   prefix=baseline_pct_;
+        where dataset_type = 'baseline';
+        var pct_row;
+        id bin_number;
+    run;
     
-    results = {}
+    proc transpose data=temp_freq_&i out=temp_oot_pct_&i(drop=_name_)
+                   prefix=oot_pct_;
+        where dataset_type = 'oot';
+        var pct_row;
+        id bin_number;
+    run;
     
-    print("=" * 60)
-    print("POPULATION STABILITY INDEX RESULTS")
-    print("=" * 60)
+    /* merge and calculate psi */
+    data psi_calculation_&i;
+        merge temp_baseline_pct_&i temp_oot_pct_&i;
+        
+        /* convert to decimals and handle zeros */
+        array baseline_arr baseline_pct_:;
+        array oot_arr oot_pct_:;
+        array bin_psi_arr bin_psi_:;
+        
+        total_psi = 0;
+        
+        do j = 1 to dim(baseline_arr);
+            if not missing(baseline_arr[j]) and not missing(oot_arr[j]) then do;
+                baseline_pct = baseline_arr[j] / 100;
+                oot_pct = oot_arr[j] / 100;
+                
+                /* handle zero percentages */
+                if baseline_pct = 0 then baseline_pct = 0.0001;
+                if oot_pct = 0 then oot_pct = 0.0001;
+                
+                /* psi calculation: (oot% - baseline%) * ln(oot% / baseline%) */
+                bin_psi_arr[j] = (oot_pct - baseline_pct) * log(oot_pct / baseline_pct);
+                total_psi = total_psi + bin_psi_arr[j];
+            end;
+        end;
+        
+        /* interpret the psi value */
+        if total_psi < 0.1 then interpretation = "Low Risk - No significant change";
+        else if total_psi < 0.2 then interpretation = "Medium Risk - Some change detected";
+        else interpretation = "High Risk - Significant population shift";
+        
+        variable_name = "&current_var";
+    run;
     
-    for var in variables:
-        try:
-            baseline_vals = baseline_data[var].dropna()
-            oot_vals = oot_data[var].dropna()
-            
-            if len(baseline_vals) == 0 or len(oot_vals) == 0:
-                warnings.warn(f"Variable {var} has no valid values in one or both datasets")
-                continue
-            
-            # create bins based on baseline distribution
-            if bin_method.lower() == 'quantile':
-                # use quantiles from baseline to create bins
-                bin_edges = np.percentile(baseline_vals, np.linspace(0, 100, n_bins + 1))
-                # handle duplicate edges (can happen with categorical-like data)
-                bin_edges = np.unique(bin_edges)
-                if len(bin_edges) < n_bins + 1:
-                    warnings.warn(f"Variable {var}: reduced bins due to duplicate values")
-            else:  # equal_width
-                bin_edges = np.linspace(baseline_vals.min(), baseline_vals.max(), n_bins + 1)
-            
-            # make sure the edges capture all data
-            bin_edges[0] = min(bin_edges[0], baseline_vals.min(), oot_vals.min()) - 0.001
-            bin_edges[-1] = max(bin_edges[-1], baseline_vals.max(), oot_vals.max()) + 0.001
-            
-            # bin both datasets using the same edges
-            baseline_bins = pd.cut(baseline_vals, bins=bin_edges, include_lowest=True, duplicates='drop')
-            oot_bins = pd.cut(oot_vals, bins=bin_edges, include_lowest=True, duplicates='drop')
-            
-            # get distribution percentages
-            baseline_dist = baseline_bins.value_counts(normalize=True, sort=False)
-            oot_dist = oot_bins.value_counts(normalize=True, sort=False)
-            
-            # make sure both have same index (some bins might be empty)
-            all_bins = baseline_dist.index.union(oot_dist.index)
-            baseline_pct = baseline_dist.reindex(all_bins, fill_value=0.0)
-            oot_pct = oot_dist.reindex(all_bins, fill_value=0.0)
-            
-            # handle zero percentages (add small value to avoid log issues)
-            baseline_pct = np.maximum(baseline_pct, 0.0001)
-            oot_pct = np.maximum(oot_pct, 0.0001)
-            
-            # calculate psi for each bin: (oot% - baseline%) * ln(oot% / baseline%)
-            bin_psi = (oot_pct - baseline_pct) * np.log(oot_pct / baseline_pct)
-            total_psi = bin_psi.sum()
-            
-            # create detailed breakdown
-            bin_analysis = pd.DataFrame({
-                'bin': all_bins.astype(str),
-                'baseline_pct': baseline_pct * 100,
-                'oot_pct': oot_pct * 100,
-                'difference': (oot_pct - baseline_pct) * 100,
-                'ln_ratio': np.log(oot_pct / baseline_pct),
-                'bin_psi': bin_psi
-            })
-            
-            # interpret psi value
-            if total_psi < 0.1:
-                interpretation = "Low Risk - No significant change"
-            elif total_psi < 0.2:
-                interpretation = "Medium Risk - Some change detected"
-            else:
-                interpretation = "High Risk - Significant population shift"
-            
-            # basic stats for context
-            baseline_stats = {
-                'count': len(baseline_vals),
-                'mean': baseline_vals.mean(),
-                'std': baseline_vals.std(),
-                'min': baseline_vals.min(),
-                'max': baseline_vals.max()
-            }
-            
-            oot_stats = {
-                'count': len(oot_vals),
-                'mean': oot_vals.mean(), 
-                'std': oot_vals.std(),
-                'min': oot_vals.min(),
-                'max': oot_vals.max()
-            }
-            
-            results[var] = {
-                'psi_value': total_psi,
-                'interpretation': interpretation,
-                'bin_analysis': bin_analysis,
-                'baseline_stats': baseline_stats,
-                'oot_stats': oot_stats
-            }
-            
-            # print summary for this variable
-            print(f"\nVariable: {var}")
-            print(f"  PSI Value: {total_psi:.4f}")
-            print(f"  Risk Level: {interpretation}")
-            print(f"  Baseline: n={baseline_stats['count']}, mean={baseline_stats['mean']:.4f}")
-            print(f"  OOT: n={oot_stats['count']}, mean={oot_stats['mean']:.4f}")
-            
-            # flag bins with high contribution if psi is concerning
-            if total_psi > 0.1:
-                high_contrib_bins = bin_analysis[bin_analysis['bin_psi'] > 0.01]
-                if len(high_contrib_bins) > 0:
-                    print(f"  High contributing bins: {len(high_contrib_bins)}")
-            
-        except Exception as e:
-            warnings.warn(f"Error calculating PSI for variable {var}: {str(e)}")
-            continue
+    /* create detailed bin analysis table */
+    data psi_detail_&current_var;
+        set psi_calculation_&i;
+        
+        array baseline_arr baseline_pct_:;
+        array oot_arr oot_pct_:;
+        array bin_psi_arr bin_psi_:;
+        
+        do bin = 1 to dim(baseline_arr);
+            if not missing(baseline_arr[bin]) or not missing(oot_arr[bin]) then do;
+                baseline_pct = coalesce(baseline_arr[bin], 0);
+                oot_pct = coalesce(oot_arr[bin], 0);
+                difference = oot_pct - baseline_pct;
+                
+                if baseline_pct > 0 and oot_pct > 0 then 
+                    bin_psi = bin_psi_arr[bin];
+                else bin_psi = 0;
+                
+                output;
+            end;
+        end;
+        
+        keep variable_name bin baseline_pct oot_pct difference bin_psi total_psi interpretation;
+    run;
     
-    if not results:
-        print("No valid PSI calculations completed")
+    /* save summary results */
+    data &output_lib..psi_summary_&current_var;
+        set psi_calculation_&i(keep=variable_name total_psi interpretation);
+    run;
     
-    return results
+    %if &print_results = Y %then %do;
+        /* print results */
+        data _null_;
+            set psi_calculation_&i baseline_stats_&i oot_stats_&i;
+            
+            put " ";
+            put "Variable: &current_var";
+            put "  PSI Value: " total_psi 8.4;
+            put "  Risk Level: " interpretation;
+            put "  Baseline: n=" baseline_n "mean=" baseline_mean 8.4;
+            put "  OOT: n=" oot_n "mean=" oot_mean 8.4;
+            
+            if total_psi > 0.1 then do;
+                put "  *** Elevated PSI - Review recommended ***";
+            end;
+        run;
+    %end;
+    
+    %next_var:
+%end;
+
+/* create consolidated summary table */
+data &output_lib..psi_summary_all;
+    set %do i = 1 %to &var_count;
+        %let current_var = %scan(&variables, &i, %str( ));
+        &output_lib..psi_summary_&current_var
+    %end;
+    ;
+run;
+
+/* cleanup temp datasets */
+proc datasets lib=work nolist;
+    delete temp_: baseline_stats_: oot_stats_: psi_calculation_:;
+quit;
+
+%if &print_results = Y %then %do;
+    %put;
+    %put PSI calculation completed. Results saved to &output_lib..psi_summary_all;
+    %put Detailed bin analysis saved as psi_detail_[variable_name];
+%end;
+
+%mend get_psi;
+
+/* example usage */
+/*
+%get_psi(
+    baseline_data=dev_sample,
+    oot_data=validation_sample,
+    variables=lgd ltv fico_score dti,
+    n_bins=10,
+    bin_method=quantile,
+    output_lib=results,
+    print_results=Y
+);
+
+proc print data=results.psi_summary_all;
+    title "PSI Summary for All Variables";
+run;
+
+proc print data=psi_detail_lgd;
+    title "Detailed PSI Analysis for LGD";
+run;
+*/
