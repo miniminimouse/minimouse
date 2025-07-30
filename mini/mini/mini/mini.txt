@@ -127,21 +127,20 @@ def rolling_mae(
                 warnings.warn(f"Dataset {idx} produced no valid rolling MAE values")
                 continue
             
-            # now handle the exclusions - this happens after all rolling calcs
+            # now handle the exclusions - just filter out the quarters we don't want
             excluded_periods = []
             if excluded_quarters:
-                rolling_results_df = pd.DataFrame({
-                    'period': rolling_mae_clean.index,
-                    'rolling_mae': rolling_mae_clean.values
-                })
+                # convert excluded quarters to the same format as our index
+                excluded_q_formatted = [q.lower() for q in excluded_quarters]
                 
-                rolling_results_df['quarter_id'] = rolling_results_df['period'].astype(str).str.replace('Q', 'q').str.lower()
+                # get quarter ids from the rolling results index
+                rolling_quarter_ids = rolling_mae_clean.index.astype(str).str.replace('Q', 'q').str.lower()
                 
-                excluded_mask = rolling_results_df['quarter_id'].isin([q.lower() for q in excluded_quarters])
-                excluded_periods = rolling_results_df[excluded_mask]['quarter_id'].unique().tolist()
+                # simple mask to keep only the ones we want
+                keep_mask = ~rolling_quarter_ids.isin(excluded_q_formatted)
+                excluded_periods = rolling_quarter_ids[~keep_mask].unique().tolist()
                 
-                # keep the good ones for final calculations
-                rolling_mae_final = rolling_results_df[~excluded_mask]['rolling_mae']
+                rolling_mae_final = rolling_mae_clean[keep_mask]
             else:
                 rolling_mae_final = rolling_mae_clean
             
