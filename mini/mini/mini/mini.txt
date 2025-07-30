@@ -1,205 +1,167 @@
-def rolling_mae(
-    datasets: List[pd.DataFrame],
-    frequency: str,
-    excluded_quarters: Optional[List[str]] = None,
-    rolling_periods: int = 4,
-    date_col: str = 'date',
-    column_mapping: Optional[Dict[int, Dict[str, str]]] = None,
-    all_cols: Optional[Dict[str, str]] = None
-) -> Dict[int, Dict[str, Union[float, pd.Series]]]:
+def get_psi(
+    baseline_data: pd.DataFrame,
+    oot_data: pd.DataFrame,
+    variables: List[str],
+    n_bins: int = 10,
+    bin_method: str = 'quantile',
+    min_bin_pct: float = 0.05
+) -> Dict[str, Dict]:
     """
-    Calculate rolling MAE with warning and breach intervals for model validation.
+    Calculate Population Stability Index (PSI) for detecting distribution shifts.
     
-    This function computes development MAE metrics used in banking model validation
-    frameworks like CCAR and CECL. It calculates rolling MAE over specified periods
-    and determines statistical thresholds for model performance monitoring.
+    PSI measures how much a variable's distribution has shifted between two samples.
+    Used heavily in banking for model monitoring and validation.
     
     Parameters:
     -----------
-    datasets : List[pd.DataFrame]
-        List of datasets to analyze. Each should contain date, actual, and predicted columns.
-    frequency : str
-        Data frequency - 'month', 'quarter', or 'year'
-    excluded_quarters : List[str], optional
-        Quarters to exclude in format "1q2008", "2q2009", etc.
-    rolling_periods : int, default=4
-        Number of periods for rolling calculation (typically 4 quarters)
-    date_col : str, default='date'
-        Name of date column (format: "yyyy-mm-dd")
-    column_mapping : Dict[int, Dict[str, str]], optional
-        Dataset-specific column mapping. Format:
-        {0: {'actual_col': 'actual_loss', 'predicted_col': 'pred_loss'},
-         1: {'actual_col': 'true_val', 'predicted_col': 'forecast'}}
-    all_cols : Dict[str, str], optional
-        Column names to use for all datasets. Format:
-        {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
-        Ignored if column_mapping is provided.
+    baseline_data : pd.DataFrame
+        Reference dataset (usually development/training sample)
+    oot_data : pd.DataFrame  
+        Out-of-time validation dataset
+    variables : List[str]
+        List of variable names to calculate PSI for
+    n_bins : int, default=10
+        Number of bins for discretization
+    bin_method : str, default='quantile'
+        Binning method: 'quantile' or 'equal_width'
+    min_bin_pct : float, default=0.05
+        Minimum percentage threshold for bin adjustments
         
     Returns:
     --------
-    Dict[int, Dict[str, Union[float, pd.Series]]]
-        Dictionary with dataset index as key, containing:
-        - 'development_mae': float - Average of rolling MAE
-        - 'warning_interval': float - Mean + 1 std dev
-        - 'breach_interval': float - Mean + 2 std dev
-        - 'rolling_mae_series': pd.Series - Complete rolling MAE time series
-        - 'excluded_periods': List[str] - Periods that were excluded
+    Dict[str, Dict]
+        Dictionary with variable names as keys, containing:
+        - 'psi_value': float - Overall PSI score
+        - 'interpretation': str - Risk level interpretation  
+        - 'bin_analysis': pd.DataFrame - Detailed bin-level breakdown
+        - 'baseline_stats': Dict - Baseline distribution stats
+        - 'oot_stats': Dict - OOT distribution stats
     """
     
-    if not datasets:
-        raise ValueError("At least one dataset must be provided")
+    if baseline_data.empty or oot_data.empty:
+        raise ValueError("Both datasets must contain data")
     
-    if frequency.lower() not in ['month', 'quarter', 'year']:
-        raise ValueError("Frequency must be 'month', 'quarter', or 'year'")
+    # check variables exist in both datasets
+    missing_baseline = [var for var in variables if var not in baseline_data.columns]
+    missing_oot = [var for var in variables if var not in oot_data.columns]
     
-    if rolling_periods < 1:
-        raise ValueError("Rolling periods must be at least 1")
+    if missing_baseline:
+        raise ValueError(f"Variables missing from baseline data: {missing_baseline}")
+    if missing_oot:
+        raise ValueError(f"Variables missing from OOT data: {missing_oot}")
     
-    # default to standard column names if nothing specified
-    if column_mapping is None and all_cols is None:
-        all_cols = {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
-    
-    excluded_quarters = excluded_quarters or []
     results = {}
     
-    for idx, df in enumerate(datasets):
+    print("=" * 60)
+    print("POPULATION STABILITY INDEX RESULTS")
+    print("=" * 60)
+    
+    for var in variables:
         try:
-            # figure out which columns to use for this dataset
-            if column_mapping and idx in column_mapping:
-                actual_col = column_mapping[idx]['actual_col']
-                predicted_col = column_mapping[idx]['predicted_col']
-            elif all_cols:
-                actual_col = all_cols['actual_col']
-                predicted_col = all_cols['predicted_col']
+            baseline_vals = baseline_data[var].dropna()
+            oot_vals = oot_data[var].dropna()
+            
+            if len(baseline_vals) == 0 or len(oot_vals) == 0:
+                warnings.warn(f"Variable {var} has no valid values in one or both datasets")
+                continue
+            
+            # create bins based on baseline distribution
+            if bin_method.lower() == 'quantile':
+                # use quantiles from baseline to create bins
+                bin_edges = np.percentile(baseline_vals, np.linspace(0, 100, n_bins + 1))
+                # handle duplicate edges (can happen with categorical-like data)
+                bin_edges = np.unique(bin_edges)
+                if len(bin_edges) < n_bins + 1:
+                    warnings.warn(f"Variable {var}: reduced bins due to duplicate values")
+            else:  # equal_width
+                bin_edges = np.linspace(baseline_vals.min(), baseline_vals.max(), n_bins + 1)
+            
+            # make sure the edges capture all data
+            bin_edges[0] = min(bin_edges[0], baseline_vals.min(), oot_vals.min()) - 0.001
+            bin_edges[-1] = max(bin_edges[-1], baseline_vals.max(), oot_vals.max()) + 0.001
+            
+            # bin both datasets using the same edges
+            baseline_bins = pd.cut(baseline_vals, bins=bin_edges, include_lowest=True, duplicates='drop')
+            oot_bins = pd.cut(oot_vals, bins=bin_edges, include_lowest=True, duplicates='drop')
+            
+            # get distribution percentages
+            baseline_dist = baseline_bins.value_counts(normalize=True, sort=False)
+            oot_dist = oot_bins.value_counts(normalize=True, sort=False)
+            
+            # make sure both have same index (some bins might be empty)
+            all_bins = baseline_dist.index.union(oot_dist.index)
+            baseline_pct = baseline_dist.reindex(all_bins, fill_value=0.0)
+            oot_pct = oot_dist.reindex(all_bins, fill_value=0.0)
+            
+            # handle zero percentages (add small value to avoid log issues)
+            baseline_pct = np.maximum(baseline_pct, 0.0001)
+            oot_pct = np.maximum(oot_pct, 0.0001)
+            
+            # calculate psi for each bin: (oot% - baseline%) * ln(oot% / baseline%)
+            bin_psi = (oot_pct - baseline_pct) * np.log(oot_pct / baseline_pct)
+            total_psi = bin_psi.sum()
+            
+            # create detailed breakdown
+            bin_analysis = pd.DataFrame({
+                'bin': all_bins.astype(str),
+                'baseline_pct': baseline_pct * 100,
+                'oot_pct': oot_pct * 100,
+                'difference': (oot_pct - baseline_pct) * 100,
+                'ln_ratio': np.log(oot_pct / baseline_pct),
+                'bin_psi': bin_psi
+            })
+            
+            # interpret psi value
+            if total_psi < 0.1:
+                interpretation = "Low Risk - No significant change"
+            elif total_psi < 0.2:
+                interpretation = "Medium Risk - Some change detected"
             else:
-                raise ValueError(f"No column mapping found for dataset {idx}")
+                interpretation = "High Risk - Significant population shift"
             
-            if df.empty:
-                warnings.warn(f"Dataset {idx} is empty, skipping...")
-                continue
-                
-            required_cols = [date_col, actual_col, predicted_col]
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                raise ValueError(f"Dataset {idx} missing columns: {missing_cols}")
-            
-            data = df.copy()
-            
-            data[date_col] = pd.to_datetime(data[date_col])
-            data = data.sort_values(date_col).reset_index(drop=True)
-            
-            # set up time periods based on what user wants
-            if frequency.lower() == 'quarter':
-                data['period'] = data[date_col].dt.to_period('Q')
-            elif frequency.lower() == 'month':
-                data['period'] = data[date_col].dt.to_period('M')
-            else:  # year
-                data['period'] = data[date_col].dt.to_period('Y')
-            
-            # need this for exclusions later but don't filter yet
-            data['quarter_id'] = data[date_col].dt.to_period('Q').astype(str).str.replace('Q', 'q').str.lower()
-            
-            # precision issues are annoying, round before calculations
-            data[actual_col] = data[actual_col].round(10)
-            data[predicted_col] = data[predicted_col].round(10)
-            
-            # collapse to period level and get means
-            period_groups = data.groupby('period').agg({
-                actual_col: 'mean',      
-                predicted_col: 'mean',   
-                'quarter_id': 'first'    
-            }).reset_index()
-            
-            # mae between the period averages
-            period_groups['period_mae'] = np.abs(period_groups[actual_col] - period_groups[predicted_col])
-            
-            if len(period_groups) < rolling_periods:
-                warnings.warn(f"Dataset {idx} has insufficient periods ({len(period_groups)}) for rolling calculation of {rolling_periods} periods")
-                continue
-            
-            # apply rolling window to the period maes
-            period_mae_series = period_groups.set_index('period')['period_mae']
-            rolling_mae_series = period_mae_series.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
-            
-            rolling_mae_clean = rolling_mae_series.dropna()
-            
-            if len(rolling_mae_clean) == 0:
-                warnings.warn(f"Dataset {idx} produced no valid rolling MAE values")
-                continue
-            
-            # now handle the exclusions - just filter out the quarters we don't want
-            excluded_periods = []
-            if excluded_quarters:
-                # convert excluded quarters from '1q2008' format to '2008q1' format to match our index
-                excluded_q_formatted = []
-                for q in excluded_quarters:
-                    q_lower = q.lower()
-                    quarter_num = q_lower[0]  # get the '1' from '1q2008'
-                    year = q_lower[2:]        # get the '2008' from '1q2008'
-                    excluded_q_formatted.append(f"{year}q{quarter_num}")
-                
-                # get quarter ids from the rolling results index
-                rolling_quarter_ids = rolling_mae_clean.index.astype(str).str.replace('Q', 'q').str.lower()
-                
-                # simple mask to keep only the ones we want
-                keep_mask = ~rolling_quarter_ids.isin(excluded_q_formatted)
-                excluded_periods = rolling_quarter_ids[~keep_mask].unique().tolist()
-                
-                rolling_mae_final = rolling_mae_clean[keep_mask]
-            else:
-                rolling_mae_final = rolling_mae_clean
-            
-            if len(rolling_mae_final) == 0:
-                warnings.warn(f"Dataset {idx} has no rolling MAE values after exclusions")
-                continue
-            
-            # calculate the final metrics
-            development_mae = rolling_mae_final.mean()
-            rolling_std = rolling_mae_final.std()
-            
-            warning_interval = development_mae + (1 * rolling_std)
-            breach_interval = development_mae + (2 * rolling_std)
-            
-            results[idx] = {
-                'development_mae': development_mae,
-                'warning_interval': warning_interval,
-                'breach_interval': breach_interval,
-                'rolling_mae_series': rolling_mae_final,
-                'excluded_periods': excluded_periods,
-                'periods_used': len(period_groups),
-                'rolling_periods_calculated': len(rolling_mae_final),
-                # stuff for debugging when things go wrong
-                'debug_period_groups': period_groups,
-                'debug_rolling_mae_clean': rolling_mae_clean,
-                'debug_rolling_mae_final': rolling_mae_final
+            # basic stats for context
+            baseline_stats = {
+                'count': len(baseline_vals),
+                'mean': baseline_vals.mean(),
+                'std': baseline_vals.std(),
+                'min': baseline_vals.min(),
+                'max': baseline_vals.max()
             }
             
+            oot_stats = {
+                'count': len(oot_vals),
+                'mean': oot_vals.mean(), 
+                'std': oot_vals.std(),
+                'min': oot_vals.min(),
+                'max': oot_vals.max()
+            }
+            
+            results[var] = {
+                'psi_value': total_psi,
+                'interpretation': interpretation,
+                'bin_analysis': bin_analysis,
+                'baseline_stats': baseline_stats,
+                'oot_stats': oot_stats
+            }
+            
+            # print summary for this variable
+            print(f"\nVariable: {var}")
+            print(f"  PSI Value: {total_psi:.4f}")
+            print(f"  Risk Level: {interpretation}")
+            print(f"  Baseline: n={baseline_stats['count']}, mean={baseline_stats['mean']:.4f}")
+            print(f"  OOT: n={oot_stats['count']}, mean={oot_stats['mean']:.4f}")
+            
+            # flag bins with high contribution if psi is concerning
+            if total_psi > 0.1:
+                high_contrib_bins = bin_analysis[bin_analysis['bin_psi'] > 0.01]
+                if len(high_contrib_bins) > 0:
+                    print(f"  High contributing bins: {len(high_contrib_bins)}")
+            
         except Exception as e:
-            warnings.warn(f"Error processing dataset {idx}: {str(e)}")
+            warnings.warn(f"Error calculating PSI for variable {var}: {str(e)}")
             continue
     
-    # Print results automatically
-    if results:
-        print("=" * 70)
-        print("ROLLING MAE VALIDATION RESULTS")
-        print("=" * 70)
-        
-        for dataset_idx, metrics in results.items():
-            dev_mae = metrics['development_mae']
-            warn_thresh = metrics['warning_interval']
-            breach_thresh = metrics['breach_interval']
-            
-            print(f"\nDataset {dataset_idx}:")
-            print(f"  Development MAE: {dev_mae:.6f}")
-            print(f"  Good interval: MAE < {warn_thresh:.6f}")
-            print(f"  Warning: {warn_thresh:.6f} <= MAE < {breach_thresh:.6f}")
-            print(f"  Breach: MAE >= {breach_thresh:.6f}")
-            print(f"  Data points used: {metrics['periods_used']}")
-            print(f"  Rolling calculations: {metrics['rolling_periods_calculated']}")
-            
-            if metrics['excluded_periods']:
-                print(f"  Excluded periods: {', '.join(metrics['excluded_periods'])}")
-    else:
-        print("No valid results to display - check your data and parameters")
+    if not results:
+        print("No valid PSI calculations completed")
     
     return results
