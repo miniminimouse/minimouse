@@ -1,4 +1,3 @@
-
 %macro get_psi(
     baseline_data=,
     oot_data=,
@@ -91,6 +90,15 @@ quit;
         where dataset = 'oot';
         oot_pct = pct;
         keep bin_number oot_pct;
+    run;
+    
+    /* sort both before merging */
+    proc sort data=temp_baseline_pct;
+        by bin_number;
+    run;
+    
+    proc sort data=temp_oot_pct;
+        by bin_number;
     run;
     
     /* merge and fill missing bins */
