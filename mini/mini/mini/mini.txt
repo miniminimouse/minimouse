@@ -1,3 +1,4 @@
+
 %macro get_psi(
     baseline_data=,
     oot_data=,
@@ -9,13 +10,11 @@
 );
 
 /*
-calculate psi for banking model validation
-compares baseline vs oot distributions to detect population shifts
+simple psi calculation - no fancy stuff that breaks
 */
 
-%local i var_count current_var num_baseline_bins;
+%local i var_count current_var;
 
-/* clean up from previous runs */
 proc datasets lib=&output_lib nolist;
     delete psi_: temp_:;
 quit;
@@ -28,233 +27,127 @@ quit;
     %put ==========================================================;
 %end;
 
-/* loop through each variable */
 %do i = 1 %to &var_count;
     %let current_var = %scan(&variables, &i, %str( ));
     
-    /* create clean datasets with just the variable we need */
-    data temp_baseline_&i;
+    /* just get the data we need */
+    data temp_baseline;
         set &baseline_data(keep=&current_var);
         where not missing(&current_var);
-        if _n_ = 0 then delete; /* just in case */
+        dataset = 'baseline';
     run;
     
-    data temp_oot_&i;
+    data temp_oot;
         set &oot_data(keep=&current_var);  
         where not missing(&current_var);
-        if _n_ = 0 then delete;
+        dataset = 'oot';
     run;
     
-    /* get counts to make sure we have data */
-    %let baseline_count = 0;
-    %let oot_count = 0;
+    /* combine for binning */
+    data temp_combined;
+        set temp_baseline temp_oot;
+    run;
     
-    proc sql noprint;
-        select count(*) into :baseline_count from temp_baseline_&i;
-        select count(*) into :oot_count from temp_oot_&i;
-    quit;
-    
-    %if &baseline_count = 0 or &oot_count = 0 %then %do;
-        %put WARNING: Variable &current_var has no valid values in one or both datasets;
-        %goto next_var;
-    %end;
-    
-    /* get basic stats */
-    proc means data=temp_baseline_&i noprint;
+    /* create bins using proc rank on combined data */
+    proc rank data=temp_combined out=temp_ranked groups=&n_bins;
         var &current_var;
-        output out=baseline_stats_&i n=baseline_n mean=baseline_mean 
-               std=baseline_std min=baseline_min max=baseline_max;
+        ranks bin_number;
     run;
     
-    proc means data=temp_oot_&i noprint;
-        var &current_var;
-        output out=oot_stats_&i n=oot_n mean=oot_mean 
-               std=oot_std min=oot_min max=oot_max;
+    /* now get frequencies by dataset and bin */
+    proc freq data=temp_ranked noprint;
+        tables dataset * bin_number / out=temp_counts outpct;
     run;
     
-    /* create bins based on baseline distribution */
-    %if %upcase(&bin_method) = QUANTILE %then %do;
-        proc rank data=temp_baseline_&i out=temp_ranked_&i groups=&n_bins;
-            var &current_var;
-            ranks bin_number;
-        run;
-        
-        /* get the actual cutpoints */
-        proc sql noprint;
-            create table temp_cutpoints_&i as
-            select bin_number, min(&current_var) as bin_min, max(&current_var) as bin_max
-            from temp_ranked_&i
-            group by bin_number
-            order by bin_number;
-        quit;
-        
-        /* create format for binning */
-        data temp_format_&i;
-            set temp_cutpoints_&i end=last;
-            retain fmtname "$bin_fmt_&i" type 'N';
-            
-            if _n_ = 1 then do;
-                start = ._;  /* missing low */
-                end = bin_max;
-                label = put(_n_, 3.);
-                output;
-            end;
-            else do;
-                /* get previous max */
-                set temp_cutpoints_&i(firstobs=_n_-1 obs=_n_-1 keep=bin_max rename=(bin_max=prev_max));
-                start = prev_max;
-                end = bin_max;
-                label = put(_n_, 3.);
-                output;
-            end;
-            
-            if last then do;
-                start = bin_max;
-                end = ._;  /* missing high */
-                label = put(_n_+1, 3.);
-                output;
-            end;
-        run;
-        
-        proc format cntlin=temp_format_&i;
-        run;
-        
-        /* apply binning to both datasets */
-        data temp_baseline_binned_&i;
-            set temp_baseline_&i;
-            bin_number = input(put(&current_var, bin_fmt_&i..), 3.);
-            dataset_type = 'baseline';
-        run;
-        
-        data temp_oot_binned_&i;
-            set temp_oot_&i;
-            bin_number = input(put(&current_var, bin_fmt_&i..), 3.);
-            dataset_type = 'oot';
-        run;
-        
-    %end;
-    %else %do;
-        /* equal width bins - simpler approach */
-        proc sql noprint;
-            select min(&current_var), max(&current_var) 
-            into :var_min, :var_max
-            from temp_baseline_&i;
-        quit;
-        
-        data temp_baseline_binned_&i;
-            set temp_baseline_&i;
-            bin_width = (&var_max - &var_min) / &n_bins;
-            bin_number = ceil((&current_var - &var_min) / bin_width);
-            if bin_number = 0 then bin_number = 1;
-            if bin_number > &n_bins then bin_number = &n_bins;
-            dataset_type = 'baseline';
-        run;
-        
-        data temp_oot_binned_&i;
-            set temp_oot_&i;
-            bin_width = (&var_max - &var_min) / &n_bins;
-            bin_number = ceil((&current_var - &var_min) / bin_width);
-            if bin_number = 0 then bin_number = 1;
-            if bin_number > &n_bins then bin_number = &n_bins;
-            dataset_type = 'oot';
-        run;
-    %end;
-    
-    /* combine and get frequencies */
-    data temp_combined_&i;
-        set temp_baseline_binned_&i temp_oot_binned_&i;
+    /* get total counts by dataset for percentage calculation */
+    proc freq data=temp_ranked noprint;
+        tables dataset / out=temp_totals;
     run;
     
-    proc freq data=temp_combined_&i noprint;
-        tables dataset_type * bin_number / out=temp_freq_&i outpct sparse;
-    run;
-    
-    /* reshape to get side-by-side percentages */
-    proc sql noprint;
-        create table temp_psi_calc_&i as
+    /* calculate percentages manually to avoid issues */
+    proc sql;
+        create table temp_pct as
         select 
-            b.bin_number,
-            b.pct_row as baseline_pct,
-            o.pct_row as oot_pct,
-            case 
-                when b.pct_row is missing then 0.0001
-                when b.pct_row = 0 then 0.0001
-                else b.pct_row/100
-            end as baseline_decimal,
-            case 
-                when o.pct_row is missing then 0.0001
-                when o.pct_row = 0 then 0.0001
-                else o.pct_row/100
-            end as oot_decimal
-        from 
-            (select bin_number, pct_row from temp_freq_&i where dataset_type='baseline') b
-            full join
-            (select bin_number, pct_row from temp_freq_&i where dataset_type='oot') o
-            on b.bin_number = o.bin_number
-        order by bin_number;
+            a.dataset,
+            a.bin_number,
+            a.count,
+            b.count as total_count,
+            (a.count / b.count) * 100 as pct
+        from temp_counts a
+        left join temp_totals b
+        on a.dataset = b.dataset;
     quit;
     
-    /* calculate psi */
-    data temp_psi_final_&i;
-        set temp_psi_calc_&i end=last;
-        
-        /* psi formula: (oot% - baseline%) * ln(oot% / baseline%) */
-        bin_psi = (oot_decimal - baseline_decimal) * log(oot_decimal / baseline_decimal);
-        
-        retain total_psi 0;
-        total_psi + bin_psi;
-        
-        if last then do;
-            /* interpret psi */
-            if total_psi < 0.1 then interpretation = "Low Risk - No significant change";
-            else if total_psi < 0.2 then interpretation = "Medium Risk - Some change detected";
-            else interpretation = "High Risk - Significant population shift";
-            
-            variable_name = "&current_var";
-            call symputx("total_psi_&i", total_psi);
-            call symputx("interpretation_&i", interpretation);
-        end;
+    /* reshape to get baseline and oot side by side */
+    data temp_baseline_pct;
+        set temp_pct;
+        where dataset = 'baseline';
+        baseline_pct = pct;
+        keep bin_number baseline_pct;
     run;
     
-    /* create final output datasets */
+    data temp_oot_pct;
+        set temp_pct;
+        where dataset = 'oot';
+        oot_pct = pct;
+        keep bin_number oot_pct;
+    run;
+    
+    /* merge and fill missing bins */
+    data temp_merged;
+        merge temp_baseline_pct temp_oot_pct;
+        by bin_number;
+        
+        /* handle missing bins */
+        if missing(baseline_pct) then baseline_pct = 0.01;
+        if missing(oot_pct) then oot_pct = 0.01;
+        if baseline_pct = 0 then baseline_pct = 0.01;
+        if oot_pct = 0 then oot_pct = 0.01;
+        
+        /* convert to decimals */
+        baseline_decimal = baseline_pct / 100;
+        oot_decimal = oot_pct / 100;
+        
+        /* calculate bin psi */
+        bin_psi = (oot_decimal - baseline_decimal) * log(oot_decimal / baseline_decimal);
+    run;
+    
+    /* sum up total psi */
+    proc sql noprint;
+        select sum(bin_psi) into :total_psi
+        from temp_merged;
+    quit;
+    
+    /* interpret psi */
+    %if %sysevalf(&total_psi < 0.1) %then %let interpretation = Low Risk - No significant change;
+    %else %if %sysevalf(&total_psi < 0.2) %then %let interpretation = Medium Risk - Some change detected;
+    %else %let interpretation = High Risk - Significant population shift;
+    
+    /* create output datasets */
     data &output_lib..psi_summary_&current_var;
         variable_name = "&current_var";
-        total_psi = &&total_psi_&i;
-        interpretation = "&&interpretation_&i";
-        output;
+        total_psi = &total_psi;
+        interpretation = "&interpretation";
     run;
     
     data &output_lib..psi_detail_&current_var;
-        set temp_psi_final_&i;
+        set temp_merged;
         variable_name = "&current_var";
-        total_psi = &&total_psi_&i;
-        interpretation = "&&interpretation_&i";
+        total_psi = &total_psi;
+        interpretation = "&interpretation";
         keep variable_name bin_number baseline_pct oot_pct bin_psi total_psi interpretation;
     run;
     
     %if &print_results = Y %then %do;
-        /* print results using the stats datasets */
-        data _null_;
-            set baseline_stats_&i;
-            set oot_stats_&i;
-            
-            put " ";
-            put "Variable: &current_var";
-            put "  PSI Value: " &&total_psi_&i 8.4;
-            put "  Risk Level: &&interpretation_&i";
-            put "  Baseline: n=" baseline_n "mean=" baseline_mean 8.4;
-            put "  OOT: n=" oot_n "mean=" oot_mean 8.4;
-            
-            if &&total_psi_&i > 0.1 then do;
-                put "  *** Elevated PSI - Review recommended ***";
-            end;
-        run;
+        %put;
+        %put Variable: &current_var;
+        %put   PSI Value: &total_psi;
+        %put   Risk Level: &interpretation;
     %end;
     
-    %next_var:
 %end;
 
-/* create consolidated summary */
+/* create summary table */
 data &output_lib..psi_summary_all;
     set %do i = 1 %to &var_count;
         %let current_var = %scan(&variables, &i, %str( ));
@@ -263,15 +156,9 @@ data &output_lib..psi_summary_all;
     ;
 run;
 
-/* cleanup temp datasets */
+/* cleanup */
 proc datasets lib=work nolist;
     delete temp_:;
 quit;
-
-%if &print_results = Y %then %do;
-    %put;
-    %put PSI calculation completed. Results saved to &output_lib..psi_summary_all;
-    %put Detailed bin analysis saved as psi_detail_[variable_name];
-%end;
 
 %mend get_psi;
