@@ -5,8 +5,13 @@
     n_bins=10,
     bin_method=quantile,
     output_lib=work,
+    min_bin_pct=0.05,
     print_results=Y
 );
+
+/*
+simple psi calculation - no fancy stuff that breaks
+*/
 
 %local i var_count current_var;
 
@@ -129,11 +134,15 @@ quit;
         merge temp_baseline_pct temp_oot_pct;
         by bin_number;
         
-        /* handle missing bins */
-        if missing(baseline_pct) then baseline_pct = 0.01;
-        if missing(oot_pct) then oot_pct = 0.01;
-        if baseline_pct = 0 then baseline_pct = 0.01;
-        if oot_pct = 0 then oot_pct = 0.01;
+        /* handle missing bins and apply min_bin_pct threshold */
+        if missing(baseline_pct) then baseline_pct = &min_bin_pct;
+        if missing(oot_pct) then oot_pct = &min_bin_pct;
+        if baseline_pct = 0 then baseline_pct = &min_bin_pct;
+        if oot_pct = 0 then oot_pct = &min_bin_pct;
+        
+        /* also enforce minimum threshold for very small percentages */
+        if baseline_pct < &min_bin_pct then baseline_pct = &min_bin_pct;
+        if oot_pct < &min_bin_pct then oot_pct = &min_bin_pct;
         
         /* convert to decimals */
         baseline_decimal = baseline_pct / 100;
