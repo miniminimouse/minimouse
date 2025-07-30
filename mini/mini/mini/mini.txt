@@ -130,8 +130,13 @@ def rolling_mae(
             # now handle the exclusions - just filter out the quarters we don't want
             excluded_periods = []
             if excluded_quarters:
-                # convert excluded quarters to the same format as our index
-                excluded_q_formatted = [q.lower() for q in excluded_quarters]
+                # convert excluded quarters from '1q2008' format to '2008q1' format to match our index
+                excluded_q_formatted = []
+                for q in excluded_quarters:
+                    q_lower = q.lower()
+                    quarter_num = q_lower[0]  # get the '1' from '1q2008'
+                    year = q_lower[2:]        # get the '2008' from '1q2008'
+                    excluded_q_formatted.append(f"{year}q{quarter_num}")
                 
                 # get quarter ids from the rolling results index
                 rolling_quarter_ids = rolling_mae_clean.index.astype(str).str.replace('Q', 'q').str.lower()
