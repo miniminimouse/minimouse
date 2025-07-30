@@ -1,9 +1,3 @@
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Optional, Tuple, Union
-from datetime import datetime
-import warnings
-
 def rolling_mae(
     datasets: List[pd.DataFrame],
     frequency: str,
@@ -61,9 +55,8 @@ def rolling_mae(
     if rolling_periods < 1:
         raise ValueError("Rolling periods must be at least 1")
     
-    # Handle column mapping logic
+    # default to standard column names if nothing specified
     if column_mapping is None and all_cols is None:
-        # Default fallback
         all_cols = {'actual_col': 'actual_var', 'predicted_col': 'predicted_var'}
     
     excluded_quarters = excluded_quarters or []
@@ -71,7 +64,7 @@ def rolling_mae(
     
     for idx, df in enumerate(datasets):
         try:
-            # Determine column names for this dataset
+            # figure out which columns to use for this dataset
             if column_mapping and idx in column_mapping:
                 actual_col = column_mapping[idx]['actual_col']
                 predicted_col = column_mapping[idx]['predicted_col']
@@ -81,7 +74,6 @@ def rolling_mae(
             else:
                 raise ValueError(f"No column mapping found for dataset {idx}")
             
-            # Basic validation
             if df.empty:
                 warnings.warn(f"Dataset {idx} is empty, skipping...")
                 continue
@@ -91,14 +83,12 @@ def rolling_mae(
             if missing_cols:
                 raise ValueError(f"Dataset {idx} missing columns: {missing_cols}")
             
-            # Work with a copy to avoid modifying original
             data = df.copy()
             
-            # Ensure date column is datetime
             data[date_col] = pd.to_datetime(data[date_col])
             data = data.sort_values(date_col).reset_index(drop=True)
             
-            # Group data by time periods first, then calculate MAE per period
+            # set up time periods based on what user wants
             if frequency.lower() == 'quarter':
                 data['period'] = data[date_col].dt.to_period('Q')
             elif frequency.lower() == 'month':
@@ -106,60 +96,66 @@ def rolling_mae(
             else:  # year
                 data['period'] = data[date_col].dt.to_period('Y')
             
-            # Create quarter identifier for later exclusions (but don't filter yet)
+            # need this for exclusions later but don't filter yet
             data['quarter_id'] = data[date_col].dt.to_period('Q').astype(str).str.replace('Q', 'q').str.lower()
             
-            # Group by period and calculate MEAN of actual and predicted values for each period
+            # precision issues are annoying, round before calculations
+            data[actual_col] = data[actual_col].round(10)
+            data[predicted_col] = data[predicted_col].round(10)
+            
+            # collapse to period level and get means
             period_groups = data.groupby('period').agg({
-                actual_col: 'mean',      # Mean actual for the period
-                predicted_col: 'mean',   # Mean predicted for the period
-                'quarter_id': 'first'    # Keep quarter_id for exclusion logic
+                actual_col: 'mean',      
+                predicted_col: 'mean',   
+                'quarter_id': 'first'    
             }).reset_index()
             
-            # Calculate absolute error for each period (comparing period means)
+            # mae between the period averages
             period_groups['period_mae'] = np.abs(period_groups[actual_col] - period_groups[predicted_col])
             
-            # Check if we have enough periods for rolling calculation
             if len(period_groups) < rolling_periods:
                 warnings.warn(f"Dataset {idx} has insufficient periods ({len(period_groups)}) for rolling calculation of {rolling_periods} periods")
                 continue
             
-            # Create time series and apply rolling window to period MAEs
+            # apply rolling window to the period maes
             period_mae_series = period_groups.set_index('period')['period_mae']
             rolling_mae_series = period_mae_series.rolling(window=rolling_periods, min_periods=rolling_periods).mean()
             
-            # Remove NaN values from rolling calculation
             rolling_mae_clean = rolling_mae_series.dropna()
             
             if len(rolling_mae_clean) == 0:
                 warnings.warn(f"Dataset {idx} produced no valid rolling MAE values")
                 continue
             
-            # NOW apply quarter exclusions to the rolling results
+            # now handle the exclusions - this happens after all rolling calcs
             excluded_periods = []
             if excluded_quarters:
-                # Get the quarter_id for each rolling result period
-                rolling_df = rolling_mae_clean.reset_index()
-                rolling_df['quarter_id'] = rolling_df['period'].astype(str).str.replace('Q', 'q').str.lower()
+                rolling_results_df = pd.DataFrame({
+                    'period': rolling_mae_clean.index,
+                    'rolling_mae': rolling_mae_clean.values
+                })
                 
-                # Filter out excluded quarters from rolling results
-                excluded_mask = rolling_df['quarter_id'].isin([q.lower() for q in excluded_quarters])
-                excluded_periods = rolling_df[excluded_mask]['quarter_id'].unique().tolist()
+                rolling_results_df['quarter_id'] = rolling_results_df['period'].astype(str).str.replace('Q', 'q').str.lower()
                 
-                # Keep only non-excluded rolling values for final calculations
-                rolling_mae_final = rolling_df[~excluded_mask]['period_mae']
+                excluded_mask = rolling_results_df['quarter_id'].isin([q.lower() for q in excluded_quarters])
+                excluded_periods = rolling_results_df[excluded_mask]['quarter_id'].unique().tolist()
+                
+                # keep the good ones for final calculations
+                rolling_mae_final = rolling_results_df[~excluded_mask]['rolling_mae']
             else:
                 rolling_mae_final = rolling_mae_clean
             
-            # Calculate development metrics from the filtered rolling results
+            if len(rolling_mae_final) == 0:
+                warnings.warn(f"Dataset {idx} has no rolling MAE values after exclusions")
+                continue
+            
+            # calculate the final metrics
             development_mae = rolling_mae_final.mean()
             rolling_std = rolling_mae_final.std()
             
-            # Calculate intervals - these are upper bounds for performance degradation
             warning_interval = development_mae + (1 * rolling_std)
             breach_interval = development_mae + (2 * rolling_std)
             
-            # Store results
             results[idx] = {
                 'development_mae': development_mae,
                 'warning_interval': warning_interval,
@@ -167,7 +163,11 @@ def rolling_mae(
                 'rolling_mae_series': rolling_mae_final,
                 'excluded_periods': excluded_periods,
                 'periods_used': len(period_groups),
-                'rolling_periods_calculated': len(rolling_mae_final)
+                'rolling_periods_calculated': len(rolling_mae_final),
+                # stuff for debugging when things go wrong
+                'debug_period_groups': period_groups,
+                'debug_rolling_mae_clean': rolling_mae_clean,
+                'debug_rolling_mae_final': rolling_mae_final
             }
             
         except Exception as e:
