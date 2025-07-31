@@ -1,72 +1,86 @@
-def cpsi_one_cut(dev_data, oot_data, var, model):
+def cpsi_one_cut(dev_data, oot_data, var_list, model):
     """
-    calculate psi for a single variable between baseline and current data
+    calculate psi for multiple variables between baseline and current data
     
     dev_data: baseline dataframe 
     oot_data: current/comparison dataframe
-    var: column name to calculate psi for
+    var_list: list of column names to calculate psi for (or single string)
     model: label for output identification
     """
     
-    # count baseline observations
-    etotal = len(dev_data)
+    # handle single variable passed as string
+    if isinstance(var_list, str):
+        var_list = [var_list]
     
-    # get expected percentages from baseline data
-    expected_counts = dev_data[var].value_counts()
-    expected_values = pd.DataFrame({
-        var: expected_counts.index,
-        'Expected_Percent': (expected_counts.values / etotal) * 100
-    })
+    all_summaries = []
+    all_detailed = []
+    psi_values = {}
     
-    # count current observations  
-    atotal = len(oot_data)
+    # loop through each variable
+    for var in var_list:
+        # count baseline observations
+        etotal = len(dev_data)
+        
+        # get expected percentages from baseline data
+        expected_counts = dev_data[var].value_counts()
+        expected_values = pd.DataFrame({
+            var: expected_counts.index,
+            'Expected_Percent': (expected_counts.values / etotal) * 100
+        })
+        
+        # count current observations  
+        atotal = len(oot_data)
+        
+        # get actual percentages from current data
+        actual_counts = oot_data[var].value_counts()
+        actual_values = pd.DataFrame({
+            var: actual_counts.index,
+            'Actual_Percent': (actual_counts.values / atotal) * 100
+        })
+        
+        # merge expected and actual - outer join to catch all bins
+        combined = pd.merge(expected_values, actual_values, on=var, how='outer')
+        
+        # handle missing values - if bin doesn't exist in baseline, set to 0
+        combined['Expected_Percent'] = combined['Expected_Percent'].fillna(0)
+        combined['Actual_Percent'] = combined['Actual_Percent'].fillna(0)
+        
+        # calculate psi pieces using the exact same formula
+        combined['PSI_Piece'] = (
+            (combined['Actual_Percent'] - combined['Expected_Percent']) * 
+            np.log((combined['Actual_Percent'] + 0.5) / (combined['Expected_Percent'] + 0.5)) / 100
+        )
+        
+        # store detailed results for this variable
+        detailed_results = combined.copy()
+        detailed_results['Variable'] = var
+        detailed_results['Model'] = model
+        all_detailed.append(detailed_results)
+        
+        # calculate total psi for this variable
+        total_psi = combined['PSI_Piece'].sum()
+        psi_values[var] = total_psi
+        
+        # summary results for this variable
+        summary = pd.DataFrame({
+            'Variable': [var],
+            'Model': [model], 
+            'Total_PSI': [total_psi],
+            'Number_of_Bins': [len(combined)]
+        })
+        all_summaries.append(summary)
+        
+        print(f"PSI Results for {model} - {var}")
+        print(f"Total PSI: {total_psi:.6f}")
+        print(f"Number of bins: {len(combined)}")
+        print("-" * 40)
     
-    # get actual percentages from current data
-    actual_counts = oot_data[var].value_counts()
-    actual_values = pd.DataFrame({
-        var: actual_counts.index,
-        'Actual_Percent': (actual_counts.values / atotal) * 100
-    })
-    
-    # merge expected and actual - outer join to catch all bins
-    combined = pd.merge(expected_values, actual_values, on=var, how='outer')
-    
-    # handle missing values - if bin doesn't exist in baseline, set to 0
-    combined['Expected_Percent'] = combined['Expected_Percent'].fillna(0)
-    combined['Actual_Percent'] = combined['Actual_Percent'].fillna(0)
-    
-    # calculate psi pieces using the exact same formula
-    combined['PSI_Piece'] = (
-        (combined['Actual_Percent'] - combined['Expected_Percent']) * 
-        np.log((combined['Actual_Percent'] + 0.5) / (combined['Expected_Percent'] + 0.5)) / 100
-    )
-    
-    # store detailed results
-    detailed_results = combined.copy()
-    detailed_results['Variable'] = var
-    detailed_results['Model'] = model
-    
-    # calculate total psi
-    total_psi = combined['PSI_Piece'].sum()
-    
-    # summary results
-    summary = pd.DataFrame({
-        'Variable': [var],
-        'Model': [model], 
-        'Total_PSI': [total_psi],
-        'Number_of_Bins': [len(combined)]
-    })
-    
-    print(f"PSI Results for {model} - {var}")
-    print(f"Total PSI: {total_psi:.6f}")
-    print(f"Number of bins: {len(combined)}")
+    # combine all results
+    final_summary = pd.concat(all_summaries, ignore_index=True)
+    final_detailed = pd.concat(all_detailed, ignore_index=True)
     
     return {
-        'summary': summary,
-        'detailed': detailed_results,
-        'psi_value': total_psi
+        'summary': final_summary,
+        'detailed': final_detailed,
+        'psi_values': psi_values
     }
-
-
-# results = cpsi_one_cut(baseline_df, current_df, 'credit_score', 'mortgage_model')
-# print(results['psi_value'])
