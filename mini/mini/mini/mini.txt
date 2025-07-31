@@ -1,239 +1,64 @@
-%macro get_psi(
-    baseline_data=,
-    oot_data=,
-    variables=,
-    n_bins=10,
-    bin_method=quantile,
-    output_lib=work,
-    min_bin_pct=0.05,
-    print_results=Y
-);
+%macro CPSI_One_Cut(dev_data=, oot_data=, var=, model=);
 
-/*
-simple psi calculation - no fancy stuff that breaks
-*/
-
-%local i var_count current_var;
-
-proc datasets lib=&output_lib nolist;
-    delete psi_: temp_:;
-quit;
-
-%let var_count = %sysfunc(countw(&variables, %str( )));
-
-%if &print_results = Y %then %do;
-    %put ==========================================================;
-    %put POPULATION STABILITY INDEX RESULTS;
-    %put ==========================================================;
-%end;
-
-%do i = 1 %to &var_count;
-    %let current_var = %scan(&variables, &i, %str( ));
-    
-    /* just get the data we need */
-    data temp_baseline;
-        set &baseline_data(keep=&current_var);
-        where not missing(&current_var);
-        dataset = 'baseline';
-    run;
-    
-    data temp_oot;
-        set &oot_data(keep=&current_var);  
-        where not missing(&current_var);
-        dataset = 'oot';
-    run;
-    
-    /* combine for binning */
-    data temp_combined;
-        set temp_baseline temp_oot;
-    run;
-    
-    /* create bins - either quantile or equal width */
-    %if %upcase(&bin_method) = QUANTILE %then %do;
-        /* calculate percentiles from baseline data only (like python) */
-        data temp_baseline_only;
-            set temp_combined;
-            where dataset = 'baseline';
-        run;
-        
-        proc univariate data=temp_baseline_only noprint;
-            var &current_var;
-            output out=temp_percentiles
-                pctlpts = %do j=0 %to &n_bins; %eval(100*&j/&n_bins) %end;
-                pctlpre = p;
-        run;
-        
-        /* create bin edges array */
-        data _null_;
-            set temp_percentiles;
-            %do j=0 %to &n_bins;
-                call symputx("bin_edge_&j", p%eval(100*&j/&n_bins));
-            %end;
-        run;
-        
-        /* now assign bins to all data using these edges */
-        data temp_ranked;
-            set temp_combined;
-            
-            /* assign bin based on percentile cutoffs */
-            %do j=1 %to &n_bins;
-                %if &j = 1 %then %do;
-                    if &current_var <= &&bin_edge_&j then bin_number = %eval(&j-1);
-                %end;
-                %else %if &j = &n_bins %then %do;
-                    else bin_number = %eval(&j-1);
-                %end;
-                %else %do;
-                    else if &current_var <= &&bin_edge_&j then bin_number = %eval(&j-1);
-                %end;
-            %end;
-        run;
-    %end;
-    %else %if %upcase(&bin_method) = EQUAL_WIDTH %then %do;
-        /* calculate equal width bins manually */
-        proc sql noprint;
-            select min(&current_var), max(&current_var) 
-            into :var_min, :var_max
-            from temp_combined;
-        quit;
-        
-        data temp_ranked;
-            set temp_combined;
-            bin_width = (&var_max - &var_min) / &n_bins;
-            
-            /* assign bin number based on equal width intervals */
-            if &current_var = &var_min then bin_number = 0;
-            else bin_number = floor((&current_var - &var_min) / bin_width);
-            
-            /* make sure we don't exceed max bins */
-            if bin_number >= &n_bins then bin_number = &n_bins - 1;
-        run;
-    %end;
-    %else %do;
-        %put ERROR: bin_method must be either QUANTILE or EQUAL_WIDTH;
-        %goto next_var;
-    %end;
-    
-    /* now get frequencies by dataset and bin */
-    proc freq data=temp_ranked noprint;
-        tables dataset * bin_number / out=temp_counts outpct;
-    run;
-    
-    /* get total counts by dataset for percentage calculation */
-    proc freq data=temp_ranked noprint;
-        tables dataset / out=temp_totals;
-    run;
-    
-    /* calculate percentages manually to avoid issues */
+    /* grab total count from baseline dataset */
     proc sql;
-        create table temp_pct as
-        select 
-            a.dataset,
-            a.bin_number,
-            a.count,
-            b.count as total_count,
-            (a.count / b.count) * 100 as pct
-        from temp_counts a
-        left join temp_totals b
-        on a.dataset = b.dataset;
+        create table work.totalz as
+        select count(*) as No_Obsv
+        from work.&dev_data.;
     quit;
-    
-    /* reshape to get baseline and oot side by side */
-    data temp_baseline_pct;
-        set temp_pct;
-        where dataset = 'baseline';
-        baseline_pct = pct;
-        keep bin_number baseline_pct;
+
+    /* store it for percentage calculations */
+    data _null_;
+        set work.totalz;
+        call symput('ETotal', No_Obsv);
     run;
-    
-    data temp_oot_pct;
-        set temp_pct;
-        where dataset = 'oot';
-        oot_pct = pct;
-        keep bin_number oot_pct;
-    run;
-    
-    /* sort both before merging */
-    proc sort data=temp_baseline_pct;
-        by bin_number;
-    run;
-    
-    proc sort data=temp_oot_pct;
-        by bin_number;
-    run;
-    
-    /* merge and fill missing bins */
-    data temp_merged;
-        merge temp_baseline_pct temp_oot_pct;
-        by bin_number;
-        
-        /* handle missing bins and apply min_bin_pct threshold */
-        if missing(baseline_pct) then baseline_pct = &min_bin_pct;
-        if missing(oot_pct) then oot_pct = &min_bin_pct;
-        if baseline_pct = 0 then baseline_pct = &min_bin_pct;
-        if oot_pct = 0 then oot_pct = &min_bin_pct;
-        
-        /* also enforce minimum threshold for very small percentages */
-        if baseline_pct < &min_bin_pct then baseline_pct = &min_bin_pct;
-        if oot_pct < &min_bin_pct then oot_pct = &min_bin_pct;
-        
-        /* convert to decimals */
-        baseline_decimal = baseline_pct / 100;
-        oot_decimal = oot_pct / 100;
-        
-        /* calculate bin psi */
-        bin_psi = (oot_decimal - baseline_decimal) * log(oot_decimal / baseline_decimal);
-    run;
-    
-    /* sum up total psi */
-    proc sql noprint;
-        select sum(bin_psi) into :total_psi
-        from temp_merged;
+
+    /* baseline distribution percentages */
+    proc sql;
+        create table work.Expected_values as
+        select distinct &var.,
+            (count(*)/&ETotal.)*100 as Expected_Percent
+        from work.&dev_data.
+        group by &var.;
     quit;
-    
-    /* interpret psi */
-    %if %sysevalf(&total_psi < 0.1) %then %let interpretation = Low Risk - No significant change;
-    %else %if %sysevalf(&total_psi < 0.2) %then %let interpretation = Medium Risk - Some change detected;
-    %else %let interpretation = High Risk - Significant population shift;
-    
-    /* create output datasets */
-    data &output_lib..psi_summary_&current_var;
-        variable_name = "&current_var";
-        total_psi = &total_psi;
-        interpretation = "&interpretation";
+
+    /* same thing for current data */
+    proc sql;
+        create table work.totalz as
+        select count(*) as No_Obsv
+        from work.&oot_data.;
+    quit;
+
+    data _null_;
+        set work.totalz;
+        call symput('ATotal', No_Obsv);
     run;
-    
-    data &output_lib..psi_detail_&current_var;
-        set temp_merged;
-        variable_name = "&current_var";
-        total_psi = &total_psi;
-        interpretation = "&interpretation";
-        keep variable_name bin_number baseline_pct oot_pct bin_psi total_psi interpretation;
+
+    /* current distribution percentages */
+    proc sql;
+        create table work.Actual_values as
+        select distinct &var.,
+            (count(*)/&ATotal.)*100 as Actual_Percent
+        from work.&oot_data.
+        group by &var.;
+    quit;
+
+    /* merge them together */
+    data work.combined;
+        merge work.Expected_values work.Actual_values;
+        by &var.;  /* added by statement for proper merge */
     run;
-    
-    %if &print_results = Y %then %do;
-        %put;
-        %put Variable: &current_var;
-        %put   PSI Value: &total_psi;
-        %put   Risk Level: &interpretation;
-    %end;
-    
-    %next_var:
-    
-%end;
 
-/* create summary table */
-data &output_lib..psi_summary_all;
-    set %do i = 1 %to &var_count;
-        %let current_var = %scan(&variables, &i, %str( ));
-        &output_lib..psi_summary_&current_var
-    %end;
-    ;
-run;
+    /* handle missing baseline percentages */
+    data work.combined;
+        set work.combined;
+        if Expected_Percent=. then Expected_Percent=0;
+    run;
 
-/* cleanup */
-proc datasets lib=work nolist;
-    delete temp_:;
-quit;
+    /* calculate the psi pieces */
+    data work.combined_&model._&var.;
+        set work.combined;
+        PSI_Piece= (Actual_Percent-Expected_Percent)*log(((Actual_Percent+.5)/(Expected_Percent+.5)))/100;
+    run;
 
-%mend get_psi;
+%mend CPSI_One_Cut;
