@@ -46,7 +46,7 @@
     /* merge them together */
     data work.combined;
         merge work.Expected_values work.Actual_values;
-        by &var.;  /* added by statement for proper merge */
+        by &var.;
     run;
 
     /* handle missing baseline percentages */
@@ -59,6 +59,22 @@
     data work.combined_&model._&var.;
         set work.combined;
         PSI_Piece= (Actual_Percent-Expected_Percent)*log(((Actual_Percent+.5)/(Expected_Percent+.5)))/100;
+    run;
+
+    /* sum up all the pieces to get final psi */
+    proc sql;
+        create table work.PSI_Summary_&model._&var. as
+        select 
+            "&var." as Variable,
+            "&model." as Model,
+            sum(PSI_Piece) as Total_PSI,
+            count(*) as Number_of_Bins
+        from work.combined_&model._&var.;
+    quit;
+
+    /* show the result */
+    proc print data=work.PSI_Summary_&model._&var.;
+        title "PSI Results for &model. - &var.";
     run;
 
 %mend CPSI_One_Cut;
