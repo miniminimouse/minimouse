@@ -1,80 +1,72 @@
-%macro CPSI_One_Cut(dev_data=, oot_data=, var=, model=);
+def cpsi_one_cut(dev_data, oot_data, var, model):
+    """
+    calculate psi for a single variable between baseline and current data
+    
+    dev_data: baseline dataframe 
+    oot_data: current/comparison dataframe
+    var: column name to calculate psi for
+    model: label for output identification
+    """
+    
+    # count baseline observations
+    etotal = len(dev_data)
+    
+    # get expected percentages from baseline data
+    expected_counts = dev_data[var].value_counts()
+    expected_values = pd.DataFrame({
+        var: expected_counts.index,
+        'Expected_Percent': (expected_counts.values / etotal) * 100
+    })
+    
+    # count current observations  
+    atotal = len(oot_data)
+    
+    # get actual percentages from current data
+    actual_counts = oot_data[var].value_counts()
+    actual_values = pd.DataFrame({
+        var: actual_counts.index,
+        'Actual_Percent': (actual_counts.values / atotal) * 100
+    })
+    
+    # merge expected and actual - outer join to catch all bins
+    combined = pd.merge(expected_values, actual_values, on=var, how='outer')
+    
+    # handle missing values - if bin doesn't exist in baseline, set to 0
+    combined['Expected_Percent'] = combined['Expected_Percent'].fillna(0)
+    combined['Actual_Percent'] = combined['Actual_Percent'].fillna(0)
+    
+    # calculate psi pieces using the exact same formula
+    combined['PSI_Piece'] = (
+        (combined['Actual_Percent'] - combined['Expected_Percent']) * 
+        np.log((combined['Actual_Percent'] + 0.5) / (combined['Expected_Percent'] + 0.5)) / 100
+    )
+    
+    # store detailed results
+    detailed_results = combined.copy()
+    detailed_results['Variable'] = var
+    detailed_results['Model'] = model
+    
+    # calculate total psi
+    total_psi = combined['PSI_Piece'].sum()
+    
+    # summary results
+    summary = pd.DataFrame({
+        'Variable': [var],
+        'Model': [model], 
+        'Total_PSI': [total_psi],
+        'Number_of_Bins': [len(combined)]
+    })
+    
+    print(f"PSI Results for {model} - {var}")
+    print(f"Total PSI: {total_psi:.6f}")
+    print(f"Number of bins: {len(combined)}")
+    
+    return {
+        'summary': summary,
+        'detailed': detailed_results,
+        'psi_value': total_psi
+    }
 
-    /* grab total count from baseline dataset */
-    proc sql;
-        create table work.totalz as
-        select count(*) as No_Obsv
-        from work.&dev_data.;
-    quit;
 
-    /* store it for percentage calculations */
-    data _null_;
-        set work.totalz;
-        call symput('ETotal', No_Obsv);
-    run;
-
-    /* baseline distribution percentages */
-    proc sql;
-        create table work.Expected_values as
-        select distinct &var.,
-            (count(*)/&ETotal.)*100 as Expected_Percent
-        from work.&dev_data.
-        group by &var.;
-    quit;
-
-    /* same thing for current data */
-    proc sql;
-        create table work.totalz as
-        select count(*) as No_Obsv
-        from work.&oot_data.;
-    quit;
-
-    data _null_;
-        set work.totalz;
-        call symput('ATotal', No_Obsv);
-    run;
-
-    /* current distribution percentages */
-    proc sql;
-        create table work.Actual_values as
-        select distinct &var.,
-            (count(*)/&ATotal.)*100 as Actual_Percent
-        from work.&oot_data.
-        group by &var.;
-    quit;
-
-    /* merge them together */
-    data work.combined;
-        merge work.Expected_values work.Actual_values;
-        by &var.;
-    run;
-
-    /* handle missing baseline percentages */
-    data work.combined;
-        set work.combined;
-        if Expected_Percent=. then Expected_Percent=0;
-    run;
-
-    /* calculate the psi pieces */
-    data work.combined_&model._&var.;
-        set work.combined;
-        PSI_Piece= (Actual_Percent-Expected_Percent)*log(((Actual_Percent+.5)/(Expected_Percent+.5)))/100;
-    run;
-
-    /* sum up all the pieces to get final psi */
-    proc sql;
-        create table work.PSI_Summary_&model._&var. as
-        select 
-            "&var." as Variable,
-            "&model." as Model,
-            sum(PSI_Piece) as Total_PSI,
-            count(*) as Number_of_Bins
-        from work.combined_&model._&var.;
-    quit;
-
-    /* show the result */
-    proc print data=work.PSI_Summary_&model._&var.;
-        title "PSI Results for &model. - &var.";
-    run;
-
-%mend CPSI_One_Cut;
+# results = cpsi_one_cut(baseline_df, current_df, 'credit_score', 'mortgage_model')
+# print(results['psi_value'])
