@@ -1,12 +1,12 @@
-def coef_stability(dev_model_results, oot_model_results, model_name):
+def variable_significance(dev_model_results, oot_model_results, model_name):
     """
-    calculate coefficient stability between development and oot model results
+    calculate variable significance using wald chi-square tests
     
     dev_model_results: dict containing development model objects
     oot_model_results: dict containing oot model objects  
     model_name: key to access specific model (e.g., 'stage1_model')
     
-    returns: dict with stability score, color code, and intermediate calculations
+    returns: dict with significance results, color code, and intermediate calculations
     """
     
     # extract the specific model objects
@@ -14,26 +14,21 @@ def coef_stability(dev_model_results, oot_model_results, model_name):
     oot_model = oot_model_results[model_name]
     
     # extract coefficients and standard errors from model objects
-    dev_coef = dev_model.coef
-    dev_stderr = dev_model.stderr
-    oot_coef = oot_model.coef
-    oot_stderr = oot_model.stderr
+    dev_params = dev_model.params
+    dev_bse = dev_model.bse
+    oot_params = oot_model.params
+    oot_bse = oot_model.bse
     
-    # get parameter names (assuming they have .param_names or similar)
-    # adjust this based on your actual model object structure
-    try:
-        param_names = dev_model.param_names
-    except AttributeError:
-        # fallback if no param_names attribute
-        param_names = [f'param_{i}' for i in range(len(dev_coef))]
+    # get parameter names
+    param_names = dev_params.index.tolist()
     
     # create dataframe for calculations
     calculations = pd.DataFrame({
         'parameter': param_names,
-        'estimate_dev': dev_coef,
-        'std_error_dev': dev_stderr,
-        'estimate_oot': oot_coef,
-        'std_error_oot': oot_stderr
+        'estimate_dev': dev_params.values,
+        'std_error_dev': dev_bse.values,
+        'estimate_oot': oot_params.values,
+        'std_error_oot': oot_bse.values
     })
     
     print(f"Analyzing {len(calculations)} parameters for model: {model_name}")
@@ -42,58 +37,67 @@ def coef_stability(dev_model_results, oot_model_results, model_name):
     # wald = (estimate / std_error)^2
     calculations['wald_chi_square_dev'] = (calculations['estimate_dev'] / calculations['std_error_dev']) ** 2
     
-    # step 2: calculate standard differences for each parameter
-    # std_diff = abs(dev_estimate - oot_estimate) / dev_std_error
-    calculations['standard_difference'] = abs(calculations['estimate_dev'] - calculations['estimate_oot']) / calculations['std_error_dev']
+    # step 2: calculate p-values from wald chi-square (1 degree of freedom)
+    calculations['p_value_dev'] = 1 - stats.chi2.cdf(calculations['wald_chi_square_dev'], df=1)
     
-    # step 3: calculate dot product (element-wise multiplication then sum)
-    # dot_product = sum(wald_chi_square_dev * standard_difference)
-    calculations['wald_x_std_diff'] = calculations['wald_chi_square_dev'] * calculations['standard_difference']
-    dot_product = calculations['wald_x_std_diff'].sum()
+    # step 3: determine significance status for each parameter
+    def get_significance_status(p_val):
+        if p_val < 0.04:
+            return "🟢 GREEN", "Significant"
+        elif 0.04 <= p_val < 0.05:
+            return "🟡 YELLOW", "Marginal"
+        else:
+            return "🔴 RED", "Not Significant"
     
-    # step 4: calculate sum of wald chi-squares for development model
-    sum_wald_chi_square = calculations['wald_chi_square_dev'].sum()
+    calculations[['color_code', 'significance_status']] = calculations['p_value_dev'].apply(
+        lambda x: pd.Series(get_significance_status(x))
+    )
     
-    # step 5: calculate coefficient stability
-    coef_stab = dot_product / sum_wald_chi_square
+    # step 4: calculate overall significance metric using MAXIMUM p-value
+    max_p_value = calculations['p_value_dev'].max()  # worst performing variable
+    significant_count = (calculations['p_value_dev'] < 0.05).sum()
+    total_params = len(calculations)
+    significant_pct = (significant_count / total_params) * 100
     
-    # determine color coding
-    if coef_stab < 1:
-        color = "🟢 GREEN"
-        status = "Stable"
-    elif 1 <= coef_stab < 2:
-        color = "🟡 YELLOW" 
-        status = "Moderate"
-    else:
-        color = "🔴 RED"
-        status = "Unstable"
+    # overall status based on maximum p-value (conservative approach)
+    overall_color, overall_status = get_significance_status(max_p_value)
     
-    print(f"\n=== Coefficient Stability Results for {model_name} ===")
-    print(f"Coefficient Stability Score: {coef_stab:.4f}")
-    print(f"Status: {color} ({status})")
-    print(f"Dot Product: {dot_product:.4f}")
-    print(f"Sum of Wald Chi-Squares: {sum_wald_chi_square:.4f}")
+    print(f"\n=== Variable Significance Results for {model_name} ===")
+    print(f"Maximum P-value (worst variable): {max_p_value:.6f}")
+    print(f"Overall Status: {overall_color} ({overall_status})")
+    print(f"Significant Variables: {significant_count}/{total_params} ({significant_pct:.1f}%)")
     
-    # show top contributors to instability
-    calculations['stability_contribution'] = (calculations['wald_x_std_diff'] / dot_product) * 100
-    top_unstable = calculations.nlargest(5, 'stability_contribution')[['parameter', 'standard_difference', 'stability_contribution']]
+    # show significance breakdown
+    significance_summary = calculations.groupby('significance_status')['parameter'].count()
+    print(f"\nSignificance Breakdown:")
+    for status, count in significance_summary.items():
+        print(f"  {status}: {count} variables")
     
-    print(f"\nTop 5 parameters contributing to instability:")
-    print(top_unstable.round(3))
+    # show the actual worst performing variables
+    worst_variables = calculations.nlargest(5, 'p_value_dev')[['parameter', 'wald_chi_square_dev', 'p_value_dev', 'significance_status']]
     
-    # return all intermediate results
+    print(f"\nWorst performing variables (highest p-values):")
+    print(worst_variables.round(6))
+    
+    # also calculate wald chi-square for oot model for comparison
+    calculations['wald_chi_square_oot'] = (calculations['estimate_oot'] / calculations['std_error_oot']) ** 2
+    calculations['p_value_oot'] = 1 - stats.chi2.cdf(calculations['wald_chi_square_oot'], df=1)
+    
+    # return all results
     results = {
-        'coefficient_stability': coef_stab,
-        'color_code': color,
-        'status': status,
-        'dot_product': dot_product,
-        'sum_wald_chi_square': sum_wald_chi_square,
+        'max_p_value': max_p_value,  # this is the single summary number
+        'overall_color_code': overall_color,
+        'overall_status': overall_status,
+        'significant_count': significant_count,
+        'total_parameters': total_params,
+        'significant_percentage': significant_pct,
         'detailed_calculations': calculations,
-        'top_unstable_params': top_unstable,
+        'worst_variables': worst_variables,
+        'significance_summary': significance_summary,
         'model_name': model_name
     }
     
     return results
 
 # example usage:
-# stability_results = coef_stability(dev_model_results, oot_model_results, 'stage1_model')
+# significance_results = variable_significance(dev_model_results, oot_model_results, 'stage1_model')
