@@ -1,28 +1,20 @@
-Ah got it! You want to compare how the **aggregate distribution** of new borrowers differs from your baseline - seeing if new applicants are concentrating more in better/worse risk buckets. Here’s what you need:
-
-```python
-import pandas as pd
-import numpy as np
-
-def distribution_shift_analysis(baseline_data, current_data, var_list, bins=10):
+def distribution_shift_analysis(baseline_data, current_data, var_dict, bins=10):
     """
     compare how aggregate distributions shift between baseline and current periods
-    shows if new borrowers are clustering in better/worse risk buckets
+    accounts for whether higher values are better or worse for each variable
     
     baseline_data: historical/development dataframe
     current_data: current/new applicant dataframe  
-    var_list: list of numeric variables to analyze
+    var_dict: dictionary {variable_name: higher_is_better}
+              e.g., {'credit_score': True, 'debt_to_income': False, 'income': True}
     bins: number of buckets to create (default 10 for deciles)
     """
     
-    # handle single variable
-    if isinstance(var_list, str):
-        var_list = [var_list]
-    
     results = {}
     
-    for var in var_list:
+    for var, higher_is_better in var_dict.items():
         print(f"\n=== Distribution Analysis for {var} ===")
+        print(f"Direction: {'Higher is better' if higher_is_better else 'Lower is better'}")
         
         # create consistent bins based on baseline data
         baseline_bins = pd.qcut(baseline_data[var], q=bins, duplicates='drop')
@@ -46,89 +38,46 @@ def distribution_shift_analysis(baseline_data, current_data, var_list, bins=10):
         comparison['Pct_Point_Change'] = comparison['Current_Pct'] - comparison['Baseline_Pct']
         comparison['Relative_Change'] = ((comparison['Current_Pct'] / comparison['Baseline_Pct']) - 1) * 100
         
-        # add bin labels (1=worst, 10=best for 10 bins)
+        # add bin labels - adjust based on direction
         comparison['Bin_Rank'] = range(1, len(comparison) + 1)
-        comparison['Risk_Category'] = ['Worst' if x <= bins//4 else 'Bad' if x <= bins//2 else 'Good' if x <= 3*bins//4 else 'Best' 
-                                      for x in comparison['Bin_Rank']]
         
-        # summary stats
-        better_bins_shift = comparison[comparison['Bin_Rank'] > bins//2]['Pct_Point_Change'].sum()
-        worse_bins_shift = comparison[comparison['Bin_Rank'] <= bins//2]['Pct_Point_Change'].sum()
+        if higher_is_better:
+            # for vars like credit score: higher bins = better quality
+            comparison['Quality_Category'] = ['Worst' if x <= bins//4 else 'Bad' if x <= bins//2 else 'Good' if x <= 3*bins//4 else 'Best' 
+                                            for x in comparison['Bin_Rank']]
+            better_bins = comparison['Bin_Rank'] > bins//2  # top half bins
+            worse_bins = comparison['Bin_Rank'] <= bins//2   # bottom half bins
+        else:
+            # for vars like debt_to_income: lower bins = better quality  
+            comparison['Quality_Category'] = ['Best' if x <= bins//4 else 'Good' if x <= bins//2 else 'Bad' if x <= 3*bins//4 else 'Worst' 
+                                            for x in comparison['Bin_Rank']]
+            better_bins = comparison['Bin_Rank'] <= bins//2  # bottom half bins (lower values)
+            worse_bins = comparison['Bin_Rank'] > bins//2    # top half bins (higher values)
         
-        print(f"Net shift to BETTER bins: {better_bins_shift:+.1f} percentage points")
-        print(f"Net shift to WORSE bins: {worse_bins_shift:+.1f} percentage points")
+        # calculate shifts to better vs worse quality buckets
+        better_quality_shift = comparison[better_bins]['Pct_Point_Change'].sum()
+        worse_quality_shift = comparison[worse_bins]['Pct_Point_Change'].sum()
         
-        if better_bins_shift > 2:
-            print("✅ New borrowers are concentrating in BETTER risk buckets")
-        elif worse_bins_shift > 2:
-            print("⚠️  New borrowers are concentrating in WORSE risk buckets") 
+        print(f"Net shift to BETTER quality bins: {better_quality_shift:+.1f} percentage points")
+        print(f"Net shift to WORSE quality bins: {worse_quality_shift:+.1f} percentage points")
+        
+        if better_quality_shift > 2:
+            print("✅ New borrowers are concentrating in BETTER quality buckets")
+        elif worse_quality_shift > 2:
+            print("⚠️  New borrowers are concentrating in WORSE quality buckets") 
         else:
             print("➡️  Distribution is relatively stable")
             
         print("\nDetailed breakdown:")
-        print(comparison[['Bin_Rank', 'Risk_Category', 'Baseline_Pct', 'Current_Pct', 'Pct_Point_Change']].round(1))
+        display_cols = ['Bin_Rank', 'Quality_Category', 'Baseline_Pct', 'Current_Pct', 'Pct_Point_Change']
+        print(comparison[display_cols].round(1))
+        
+        # store results with direction info
+        comparison['Variable'] = var
+        comparison['Higher_Is_Better'] = higher_is_better
+        comparison['Better_Quality_Shift'] = better_quality_shift
+        comparison['Worse_Quality_Shift'] = worse_quality_shift
         
         results[var] = comparison
     
     return results
-
-# example usage:
-# results = distribution_shift_analysis(dev_df, oot_df, ['credit_score', 'debt_to_income', 'loan_amount'])
-
-# for single variable:
-# results = distribution_shift_analysis(dev_df, oot_df, 'credit_score')
-```
-
-## Quick summary version:
-
-```python
-def quick_distribution_summary(baseline_data, current_data, var_list, bins=10):
-    """quick summary of which direction distributions are shifting"""
-    
-    if isinstance(var_list, str):
-        var_list = [var_list]
-        
-    summary_results = []
-    
-    for var in var_list:
-        # create bins based on baseline
-        baseline_bins = pd.qcut(baseline_data[var], q=bins, duplicates='drop')
-        bin_edges = baseline_bins.cat.categories
-        
-        # apply to both datasets
-        baseline_binned = pd.cut(baseline_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
-        current_binned = pd.cut(current_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
-        
-        # get distributions
-        baseline_dist = baseline_binned.value_counts(normalize=True).sort_index() * 100
-        current_dist = current_binned.value_counts(normalize=True).sort_index() * 100
-        
-        # calculate shifts to better vs worse buckets
-        bin_ranks = range(1, len(baseline_dist) + 1)
-        pct_changes = (current_dist - baseline_dist).values
-        
-        better_bins_shift = sum([change for rank, change in zip(bin_ranks, pct_changes) if rank > bins//2])
-        worse_bins_shift = sum([change for rank, change in zip(bin_ranks, pct_changes) if rank <= bins//2])
-        
-        summary_results.append({
-            'Variable': var,
-            'Better_Bins_Shift': better_bins_shift,
-            'Worse_Bins_Shift': worse_bins_shift,
-            'Net_Quality_Change': better_bins_shift + worse_bins_shift,
-            'Direction': 'Better' if better_bins_shift > abs(worse_bins_shift) else 'Worse' if abs(worse_bins_shift) > better_bins_shift else 'Stable'
-        })
-    
-    return pd.DataFrame(summary_results).round(2)
-
-# usage:
-# summary = quick_distribution_summary(dev_df, oot_df, ['credit_score', 'dti_ratio', 'income'])
-# print(summary)
-```
-
-**What this shows:**
-
-- **Positive “Better_Bins_Shift”** = more new borrowers in top risk buckets (good news)
-- **Positive “Worse_Bins_Shift”** = more new borrowers in bottom risk buckets (bad news)
-- **Pct_Point_Change** = how many percentage points shifted between baseline and current
-
-This gives you exactly what you want - aggregate view of whether your new applicant population is getting riskier or safer compared to your development sample!​​​​​​​​​​​​​​​​
