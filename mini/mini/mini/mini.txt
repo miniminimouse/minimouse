@@ -1,13 +1,12 @@
+Ah! I see the issue now. You’re saying that within each variable, ALL the “better quality” bins show the exact same number, and ALL the “worse quality” bins show the exact same number. That’s definitely wrong.
+
+The problem is in the detailed analysis function - I’m calculating the totals once and then assigning them to every row. Here’s the fix:
+
+```python
 def distribution_shift_analysis(baseline_data, current_data, var_dict, bins=10):
     """
     compare how aggregate distributions shift between baseline and current periods
     accounts for whether higher values are better or worse for each variable
-    
-    baseline_data: historical/development dataframe
-    current_data: current/new applicant dataframe  
-    var_dict: dictionary {variable_name: higher_is_better}
-              e.g., {'credit_score': True, 'debt_to_income': False, 'income': True}
-    bins: number of buckets to create (default 10 for deciles)
     """
     
     results = {}
@@ -45,39 +44,44 @@ def distribution_shift_analysis(baseline_data, current_data, var_dict, bins=10):
             # for vars like credit score: higher bins = better quality
             comparison['Quality_Category'] = ['Worst' if x <= bins//4 else 'Bad' if x <= bins//2 else 'Good' if x <= 3*bins//4 else 'Best' 
                                             for x in comparison['Bin_Rank']]
-            better_bins = comparison['Bin_Rank'] > bins//2  # top half bins
-            worse_bins = comparison['Bin_Rank'] <= bins//2   # bottom half bins
+            better_bins_mask = comparison['Bin_Rank'] > bins//2
         else:
             # for vars like debt_to_income: lower bins = better quality  
             comparison['Quality_Category'] = ['Best' if x <= bins//4 else 'Good' if x <= bins//2 else 'Bad' if x <= 3*bins//4 else 'Worst' 
                                             for x in comparison['Bin_Rank']]
-            better_bins = comparison['Bin_Rank'] <= bins//2  # bottom half bins (lower values)
-            worse_bins = comparison['Bin_Rank'] > bins//2    # top half bins (higher values)
+            better_bins_mask = comparison['Bin_Rank'] <= bins//2
         
-        # calculate shifts to better vs worse quality buckets
-        better_quality_shift = comparison[better_bins]['Pct_Point_Change'].sum()
-        worse_quality_shift = comparison[worse_bins]['Pct_Point_Change'].sum()
+        # FIXED: calculate total shifts (not per-bin values)
+        better_quality_shift = comparison[better_bins_mask]['Pct_Point_Change'].sum()
+        worse_quality_shift = comparison[~better_bins_mask]['Pct_Point_Change'].sum()
         
         print(f"Net shift to BETTER quality bins: {better_quality_shift:+.1f} percentage points")
         print(f"Net shift to WORSE quality bins: {worse_quality_shift:+.1f} percentage points")
         
         if better_quality_shift > 2:
             print("✅ New borrowers are concentrating in BETTER quality buckets")
-        elif worse_quality_shift > 2:
+        elif abs(worse_quality_shift) > 2:  # fixed: use abs here since worse_quality_shift might be negative
             print("⚠️  New borrowers are concentrating in WORSE quality buckets") 
         else:
             print("➡️  Distribution is relatively stable")
-            
+        
+        # FIXED: don't add these totals to every row - they're summary stats
+        comparison['Variable'] = var
+        comparison['Higher_Is_Better'] = higher_is_better
+        
         print("\nDetailed breakdown:")
         display_cols = ['Bin_Rank', 'Quality_Category', 'Baseline_Pct', 'Current_Pct', 'Pct_Point_Change']
         print(comparison[display_cols].round(1))
         
-        # store results with direction info
-        comparison['Variable'] = var
-        comparison['Higher_Is_Better'] = higher_is_better
-        comparison['Better_Quality_Shift'] = better_quality_shift
-        comparison['Worse_Quality_Shift'] = worse_quality_shift
+        # store the summary stats separately
+        comparison.attrs['better_quality_shift'] = better_quality_shift
+        comparison.attrs['worse_quality_shift'] = worse_quality_shift
         
         results[var] = comparison
     
     return results
+```
+
+Now each bin will show its own individual `Pct_Point_Change` (which should vary by bin), and the summary totals are calculated correctly but not added as columns to every row.
+
+The issue was I was calculating `better_quality_shift` and `worse_quality_shift` once per variable and then adding those same summary numbers to every single bin row, which made no sense. Now each bin shows its own change, and the summary is just printed/stored separately.​​​​​​​​​​​​​​​​
