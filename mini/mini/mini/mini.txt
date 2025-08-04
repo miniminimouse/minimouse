@@ -1,86 +1,134 @@
-def cpsi_one_cut(dev_data, oot_data, var_list, model):
+Ah got it! You want to compare how the **aggregate distribution** of new borrowers differs from your baseline - seeing if new applicants are concentrating more in better/worse risk buckets. Here’s what you need:
+
+```python
+import pandas as pd
+import numpy as np
+
+def distribution_shift_analysis(baseline_data, current_data, var_list, bins=10):
     """
-    calculate psi for multiple variables between baseline and current data
+    compare how aggregate distributions shift between baseline and current periods
+    shows if new borrowers are clustering in better/worse risk buckets
     
-    dev_data: baseline dataframe 
-    oot_data: current/comparison dataframe
-    var_list: list of column names to calculate psi for (or single string)
-    model: label for output identification
+    baseline_data: historical/development dataframe
+    current_data: current/new applicant dataframe  
+    var_list: list of numeric variables to analyze
+    bins: number of buckets to create (default 10 for deciles)
     """
     
-    # handle single variable passed as string
+    # handle single variable
     if isinstance(var_list, str):
         var_list = [var_list]
     
-    all_summaries = []
-    all_detailed = []
-    psi_values = {}
+    results = {}
     
-    # loop through each variable
     for var in var_list:
-        # count baseline observations
-        etotal = len(dev_data)
+        print(f"\n=== Distribution Analysis for {var} ===")
         
-        # get expected percentages from baseline data
-        expected_counts = dev_data[var].value_counts()
-        expected_values = pd.DataFrame({
-            var: expected_counts.index,
-            'Expected_Percent': (expected_counts.values / etotal) * 100
-        })
+        # create consistent bins based on baseline data
+        baseline_bins = pd.qcut(baseline_data[var], q=bins, duplicates='drop')
+        bin_edges = baseline_bins.cat.categories
         
-        # count current observations  
-        atotal = len(oot_data)
+        # apply same bins to both datasets
+        baseline_binned = pd.cut(baseline_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
+        current_binned = pd.cut(current_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
         
-        # get actual percentages from current data
-        actual_counts = oot_data[var].value_counts()
-        actual_values = pd.DataFrame({
-            var: actual_counts.index,
-            'Actual_Percent': (actual_counts.values / atotal) * 100
-        })
+        # get distribution percentages
+        baseline_dist = baseline_binned.value_counts(normalize=True).sort_index() * 100
+        current_dist = current_binned.value_counts(normalize=True).sort_index() * 100
         
-        # merge expected and actual - outer join to catch all bins
-        combined = pd.merge(expected_values, actual_values, on=var, how='outer')
+        # combine for comparison
+        comparison = pd.DataFrame({
+            'Baseline_Pct': baseline_dist,
+            'Current_Pct': current_dist
+        }).fillna(0)
         
-        # handle missing values - if bin doesn't exist in baseline, set to 0
-        combined['Expected_Percent'] = combined['Expected_Percent'].fillna(0)
-        combined['Actual_Percent'] = combined['Actual_Percent'].fillna(0)
+        # calculate the shift
+        comparison['Pct_Point_Change'] = comparison['Current_Pct'] - comparison['Baseline_Pct']
+        comparison['Relative_Change'] = ((comparison['Current_Pct'] / comparison['Baseline_Pct']) - 1) * 100
         
-        # calculate psi pieces using the exact same formula
-        combined['PSI_Piece'] = (
-            (combined['Actual_Percent'] - combined['Expected_Percent']) * 
-            np.log((combined['Actual_Percent'] + 0.5) / (combined['Expected_Percent'] + 0.5)) / 100
-        )
+        # add bin labels (1=worst, 10=best for 10 bins)
+        comparison['Bin_Rank'] = range(1, len(comparison) + 1)
+        comparison['Risk_Category'] = ['Worst' if x <= bins//4 else 'Bad' if x <= bins//2 else 'Good' if x <= 3*bins//4 else 'Best' 
+                                      for x in comparison['Bin_Rank']]
         
-        # store detailed results for this variable
-        detailed_results = combined.copy()
-        detailed_results['Variable'] = var
-        detailed_results['Model'] = model
-        all_detailed.append(detailed_results)
+        # summary stats
+        better_bins_shift = comparison[comparison['Bin_Rank'] > bins//2]['Pct_Point_Change'].sum()
+        worse_bins_shift = comparison[comparison['Bin_Rank'] <= bins//2]['Pct_Point_Change'].sum()
         
-        # calculate total psi for this variable
-        total_psi = combined['PSI_Piece'].sum()
-        psi_values[var] = total_psi
+        print(f"Net shift to BETTER bins: {better_bins_shift:+.1f} percentage points")
+        print(f"Net shift to WORSE bins: {worse_bins_shift:+.1f} percentage points")
         
-        # summary results for this variable
-        summary = pd.DataFrame({
-            'Variable': [var],
-            'Model': [model], 
-            'Total_PSI': [total_psi],
-            'Number_of_Bins': [len(combined)]
-        })
-        all_summaries.append(summary)
+        if better_bins_shift > 2:
+            print("✅ New borrowers are concentrating in BETTER risk buckets")
+        elif worse_bins_shift > 2:
+            print("⚠️  New borrowers are concentrating in WORSE risk buckets") 
+        else:
+            print("➡️  Distribution is relatively stable")
+            
+        print("\nDetailed breakdown:")
+        print(comparison[['Bin_Rank', 'Risk_Category', 'Baseline_Pct', 'Current_Pct', 'Pct_Point_Change']].round(1))
         
-        print(f"PSI Results for {model} - {var}")
-        print(f"Total PSI: {total_psi:.6f}")
-        print(f"Number of bins: {len(combined)}")
-        print("-" * 40)
+        results[var] = comparison
     
-    # combine all results
-    final_summary = pd.concat(all_summaries, ignore_index=True)
-    final_detailed = pd.concat(all_detailed, ignore_index=True)
+    return results
+
+# example usage:
+# results = distribution_shift_analysis(dev_df, oot_df, ['credit_score', 'debt_to_income', 'loan_amount'])
+
+# for single variable:
+# results = distribution_shift_analysis(dev_df, oot_df, 'credit_score')
+```
+
+## Quick summary version:
+
+```python
+def quick_distribution_summary(baseline_data, current_data, var_list, bins=10):
+    """quick summary of which direction distributions are shifting"""
     
-    return {
-        'summary': final_summary,
-        'detailed': final_detailed,
-        'psi_values': psi_values
-    }
+    if isinstance(var_list, str):
+        var_list = [var_list]
+        
+    summary_results = []
+    
+    for var in var_list:
+        # create bins based on baseline
+        baseline_bins = pd.qcut(baseline_data[var], q=bins, duplicates='drop')
+        bin_edges = baseline_bins.cat.categories
+        
+        # apply to both datasets
+        baseline_binned = pd.cut(baseline_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
+        current_binned = pd.cut(current_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
+        
+        # get distributions
+        baseline_dist = baseline_binned.value_counts(normalize=True).sort_index() * 100
+        current_dist = current_binned.value_counts(normalize=True).sort_index() * 100
+        
+        # calculate shifts to better vs worse buckets
+        bin_ranks = range(1, len(baseline_dist) + 1)
+        pct_changes = (current_dist - baseline_dist).values
+        
+        better_bins_shift = sum([change for rank, change in zip(bin_ranks, pct_changes) if rank > bins//2])
+        worse_bins_shift = sum([change for rank, change in zip(bin_ranks, pct_changes) if rank <= bins//2])
+        
+        summary_results.append({
+            'Variable': var,
+            'Better_Bins_Shift': better_bins_shift,
+            'Worse_Bins_Shift': worse_bins_shift,
+            'Net_Quality_Change': better_bins_shift + worse_bins_shift,
+            'Direction': 'Better' if better_bins_shift > abs(worse_bins_shift) else 'Worse' if abs(worse_bins_shift) > better_bins_shift else 'Stable'
+        })
+    
+    return pd.DataFrame(summary_results).round(2)
+
+# usage:
+# summary = quick_distribution_summary(dev_df, oot_df, ['credit_score', 'dti_ratio', 'income'])
+# print(summary)
+```
+
+**What this shows:**
+
+- **Positive “Better_Bins_Shift”** = more new borrowers in top risk buckets (good news)
+- **Positive “Worse_Bins_Shift”** = more new borrowers in bottom risk buckets (bad news)
+- **Pct_Point_Change** = how many percentage points shifted between baseline and current
+
+This gives you exactly what you want - aggregate view of whether your new applicant population is getting riskier or safer compared to your development sample!​​​​​​​​​​​​​​​​
