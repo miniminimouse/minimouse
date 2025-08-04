@@ -1,87 +1,99 @@
-Ah! I see the issue now. You’re saying that within each variable, ALL the “better quality” bins show the exact same number, and ALL the “worse quality” bins show the exact same number. That’s definitely wrong.
-
-The problem is in the detailed analysis function - I’m calculating the totals once and then assigning them to every row. Here’s the fix:
-
-```python
-def distribution_shift_analysis(baseline_data, current_data, var_dict, bins=10):
+def coef_stability(dev_model_results, oot_model_results, model_name):
     """
-    compare how aggregate distributions shift between baseline and current periods
-    accounts for whether higher values are better or worse for each variable
+    calculate coefficient stability between development and oot model results
+    
+    dev_model_results: dict containing development model objects
+    oot_model_results: dict containing oot model objects  
+    model_name: key to access specific model (e.g., 'stage1_model')
+    
+    returns: dict with stability score, color code, and intermediate calculations
     """
     
-    results = {}
+    # extract the specific model objects
+    dev_model = dev_model_results[model_name]
+    oot_model = oot_model_results[model_name]
     
-    for var, higher_is_better in var_dict.items():
-        print(f"\n=== Distribution Analysis for {var} ===")
-        print(f"Direction: {'Higher is better' if higher_is_better else 'Lower is better'}")
-        
-        # create consistent bins based on baseline data
-        baseline_bins = pd.qcut(baseline_data[var], q=bins, duplicates='drop')
-        bin_edges = baseline_bins.cat.categories
-        
-        # apply same bins to both datasets
-        baseline_binned = pd.cut(baseline_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
-        current_binned = pd.cut(current_data[var], bins=[interval.left for interval in bin_edges] + [bin_edges[-1].right], include_lowest=True)
-        
-        # get distribution percentages
-        baseline_dist = baseline_binned.value_counts(normalize=True).sort_index() * 100
-        current_dist = current_binned.value_counts(normalize=True).sort_index() * 100
-        
-        # combine for comparison
-        comparison = pd.DataFrame({
-            'Baseline_Pct': baseline_dist,
-            'Current_Pct': current_dist
-        }).fillna(0)
-        
-        # calculate the shift
-        comparison['Pct_Point_Change'] = comparison['Current_Pct'] - comparison['Baseline_Pct']
-        comparison['Relative_Change'] = ((comparison['Current_Pct'] / comparison['Baseline_Pct']) - 1) * 100
-        
-        # add bin labels - adjust based on direction
-        comparison['Bin_Rank'] = range(1, len(comparison) + 1)
-        
-        if higher_is_better:
-            # for vars like credit score: higher bins = better quality
-            comparison['Quality_Category'] = ['Worst' if x <= bins//4 else 'Bad' if x <= bins//2 else 'Good' if x <= 3*bins//4 else 'Best' 
-                                            for x in comparison['Bin_Rank']]
-            better_bins_mask = comparison['Bin_Rank'] > bins//2
-        else:
-            # for vars like debt_to_income: lower bins = better quality  
-            comparison['Quality_Category'] = ['Best' if x <= bins//4 else 'Good' if x <= bins//2 else 'Bad' if x <= 3*bins//4 else 'Worst' 
-                                            for x in comparison['Bin_Rank']]
-            better_bins_mask = comparison['Bin_Rank'] <= bins//2
-        
-        # FIXED: calculate total shifts (not per-bin values)
-        better_quality_shift = comparison[better_bins_mask]['Pct_Point_Change'].sum()
-        worse_quality_shift = comparison[~better_bins_mask]['Pct_Point_Change'].sum()
-        
-        print(f"Net shift to BETTER quality bins: {better_quality_shift:+.1f} percentage points")
-        print(f"Net shift to WORSE quality bins: {worse_quality_shift:+.1f} percentage points")
-        
-        if better_quality_shift > 2:
-            print("✅ New borrowers are concentrating in BETTER quality buckets")
-        elif abs(worse_quality_shift) > 2:  # fixed: use abs here since worse_quality_shift might be negative
-            print("⚠️  New borrowers are concentrating in WORSE quality buckets") 
-        else:
-            print("➡️  Distribution is relatively stable")
-        
-        # FIXED: don't add these totals to every row - they're summary stats
-        comparison['Variable'] = var
-        comparison['Higher_Is_Better'] = higher_is_better
-        
-        print("\nDetailed breakdown:")
-        display_cols = ['Bin_Rank', 'Quality_Category', 'Baseline_Pct', 'Current_Pct', 'Pct_Point_Change']
-        print(comparison[display_cols].round(1))
-        
-        # store the summary stats separately
-        comparison.attrs['better_quality_shift'] = better_quality_shift
-        comparison.attrs['worse_quality_shift'] = worse_quality_shift
-        
-        results[var] = comparison
+    # extract coefficients and standard errors from model objects
+    dev_coef = dev_model.coef
+    dev_stderr = dev_model.stderr
+    oot_coef = oot_model.coef
+    oot_stderr = oot_model.stderr
+    
+    # get parameter names (assuming they have .param_names or similar)
+    # adjust this based on your actual model object structure
+    try:
+        param_names = dev_model.param_names
+    except AttributeError:
+        # fallback if no param_names attribute
+        param_names = [f'param_{i}' for i in range(len(dev_coef))]
+    
+    # create dataframe for calculations
+    calculations = pd.DataFrame({
+        'parameter': param_names,
+        'estimate_dev': dev_coef,
+        'std_error_dev': dev_stderr,
+        'estimate_oot': oot_coef,
+        'std_error_oot': oot_stderr
+    })
+    
+    print(f"Analyzing {len(calculations)} parameters for model: {model_name}")
+    
+    # step 1: calculate wald chi-square for development model
+    # wald = (estimate / std_error)^2
+    calculations['wald_chi_square_dev'] = (calculations['estimate_dev'] / calculations['std_error_dev']) ** 2
+    
+    # step 2: calculate standard differences for each parameter
+    # std_diff = abs(dev_estimate - oot_estimate) / dev_std_error
+    calculations['standard_difference'] = abs(calculations['estimate_dev'] - calculations['estimate_oot']) / calculations['std_error_dev']
+    
+    # step 3: calculate dot product (element-wise multiplication then sum)
+    # dot_product = sum(wald_chi_square_dev * standard_difference)
+    calculations['wald_x_std_diff'] = calculations['wald_chi_square_dev'] * calculations['standard_difference']
+    dot_product = calculations['wald_x_std_diff'].sum()
+    
+    # step 4: calculate sum of wald chi-squares for development model
+    sum_wald_chi_square = calculations['wald_chi_square_dev'].sum()
+    
+    # step 5: calculate coefficient stability
+    coef_stab = dot_product / sum_wald_chi_square
+    
+    # determine color coding
+    if coef_stab < 1:
+        color = "🟢 GREEN"
+        status = "Stable"
+    elif 1 <= coef_stab < 2:
+        color = "🟡 YELLOW" 
+        status = "Moderate"
+    else:
+        color = "🔴 RED"
+        status = "Unstable"
+    
+    print(f"\n=== Coefficient Stability Results for {model_name} ===")
+    print(f"Coefficient Stability Score: {coef_stab:.4f}")
+    print(f"Status: {color} ({status})")
+    print(f"Dot Product: {dot_product:.4f}")
+    print(f"Sum of Wald Chi-Squares: {sum_wald_chi_square:.4f}")
+    
+    # show top contributors to instability
+    calculations['stability_contribution'] = (calculations['wald_x_std_diff'] / dot_product) * 100
+    top_unstable = calculations.nlargest(5, 'stability_contribution')[['parameter', 'standard_difference', 'stability_contribution']]
+    
+    print(f"\nTop 5 parameters contributing to instability:")
+    print(top_unstable.round(3))
+    
+    # return all intermediate results
+    results = {
+        'coefficient_stability': coef_stab,
+        'color_code': color,
+        'status': status,
+        'dot_product': dot_product,
+        'sum_wald_chi_square': sum_wald_chi_square,
+        'detailed_calculations': calculations,
+        'top_unstable_params': top_unstable,
+        'model_name': model_name
+    }
     
     return results
-```
 
-Now each bin will show its own individual `Pct_Point_Change` (which should vary by bin), and the summary totals are calculated correctly but not added as columns to every row.
-
-The issue was I was calculating `better_quality_shift` and `worse_quality_shift` once per variable and then adding those same summary numbers to every single bin row, which made no sense. Now each bin shows its own change, and the summary is just printed/stored separately.​​​​​​​​​​​​​​​​
+# example usage:
+# stability_results = coef_stability(dev_model_results, oot_model_results, 'stage1_model')
