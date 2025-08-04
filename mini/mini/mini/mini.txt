@@ -1,103 +1,94 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import chi2   # chi-square cdf for p-values
+from numpy.linalg import inv
+
 def variable_significance(dev_model_results, oot_model_results, model_name):
     """
-    calculate variable significance using wald chi-square tests
-    
-    dev_model_results: dict containing development model objects
-    oot_model_results: dict containing oot model objects  
-    model_name: key to access specific model (e.g., 'stage1_model')
-    
-    returns: dict with significance results, color code, and intermediate calculations
+    assesses variable significance and coefficient drift between
+    development and oot samples using wald chi-square tests
     """
+    # --- pull models ---------------------------------------------------------
+    dev = dev_model_results[model_name]
+    oot = oot_model_results[model_name]
     
-    # extract the specific model objects
-    dev_model = dev_model_results[model_name]
-    oot_model = oot_model_results[model_name]
+    # coefficients and ses
+    beta_d, se_d = dev.params, dev.bse
+    beta_o, se_o = oot.params, oot.bse
     
-    # extract coefficients and standard errors from model objects
-    dev_params = dev_model.params
-    dev_bse = dev_model.bse
-    oot_params = oot_model.params
-    oot_bse = oot_model.bse
+    # names – fall back if attribute missing
+    try:
+        names = dev.param_names
+    except AttributeError:
+        names = getattr(beta_d, 'index', pd.Index([f'param_{i}' for i in range(len(beta_d))]))
     
-    # get parameter names
-    param_names = dev_params.index.tolist()
+    # dataframe with per-sample wald stats & p-values -------------------------
+    df = pd.DataFrame({'param': names,
+                       'beta_dev': beta_d,
+                       'se_dev'  : se_d,
+                       'beta_oot': beta_o,
+                       'se_oot'  : se_o})
     
-    # create dataframe for calculations
-    calculations = pd.DataFrame({
-        'parameter': param_names,
-        'estimate_dev': dev_params.values,
-        'std_error_dev': dev_bse.values,
-        'estimate_oot': oot_params.values,
-        'std_error_oot': oot_bse.values
-    })
+    df['wald_dev'] = (df['beta_dev'] / df['se_dev']) ** 2
+    df['p_dev']    = 1 - chi2.cdf(df['wald_dev'], 1)
     
-    print(f"Analyzing {len(calculations)} parameters for model: {model_name}")
+    df['wald_oot'] = (df['beta_oot'] / df['se_oot']) ** 2
+    df['p_oot']    = 1 - chi2.cdf(df['wald_oot'], 1)
     
-    # step 1: calculate wald chi-square for development model
-    # wald = (estimate / std_error)^2
-    calculations['wald_chi_square_dev'] = (calculations['estimate_dev'] / calculations['std_error_dev']) ** 2
+    # --- joint drift test ----------------------------------------------------
+    # difference vector and summed covariance matrix
+    delta = df['beta_dev'] - df['beta_oot']
     
-    # step 2: calculate p-values from wald chi-square (1 degree of freedom)
-    calculations['p_value_dev'] = 1 - stats.chi2.cdf(calculations['wald_chi_square_dev'], df=1)
+    # try full cov matrices; if not available, use diagonal from bse^2
+    try:
+        cov_d = dev.cov_params()
+    except AttributeError:
+        cov_d = np.diag(se_d**2)
+    try:
+        cov_o = oot.cov_params()
+    except AttributeError:
+        cov_o = np.diag(se_o**2)
     
-    # step 3: determine significance status for each parameter
-    def get_significance_status(p_val):
-        if p_val < 0.04:
-            return "🟢 GREEN", "Significant"
-        elif 0.04 <= p_val < 0.05:
-            return "🟡 YELLOW", "Marginal"
-        else:
-            return "🔴 RED", "Not Significant"
+    var_diff = cov_d + cov_o
+    wald_joint = float(delta.T @ inv(var_diff) @ delta)
+    p_joint    = 1 - chi2.cdf(wald_joint, len(delta))
     
-    calculations[['color_code', 'significance_status']] = calculations['p_value_dev'].apply(
-        lambda x: pd.Series(get_significance_status(x))
-    )
+    # --- traffic-light logic --------------------------------------------------
+    worst_p_dev = df['p_dev'].max()
+    worst_p_oot = df['p_oot'].max()
     
-    # step 4: calculate overall significance metric using MAXIMUM p-value
-    max_p_value = calculations['p_value_dev'].max()  # worst performing variable
-    significant_count = (calculations['p_value_dev'] < 0.05).sum()
-    total_params = len(calculations)
-    significant_pct = (significant_count / total_params) * 100
+    if (worst_p_dev < 0.04) and (worst_p_oot < 0.04) and (p_joint >= 0.05):
+        color, status = '🟢', 'all variables significant; no drift'
+    elif (worst_p_dev < 0.05) and (worst_p_oot < 0.05) and (p_joint >= 0.04):
+        color, status = '🟡', 'borderline'
+    else:
+        color, status = '🔴', 'insufficient significance or drift detected'
     
-    # overall status based on maximum p-value (conservative approach)
-    overall_color, overall_status = get_significance_status(max_p_value)
+    # top five weakest variables (highest max-p across samples)
+    df['p_max'] = df[['p_dev', 'p_oot']].max(axis=1)
+    offenders = df.nlargest(5, 'p_max')[['param', 'p_dev', 'p_oot', 'p_max']]
     
-    print(f"\n=== Variable Significance Results for {model_name} ===")
-    print(f"Maximum P-value (worst variable): {max_p_value:.6f}")
-    print(f"Overall Status: {overall_color} ({overall_status})")
-    print(f"Significant Variables: {significant_count}/{total_params} ({significant_pct:.1f}%)")
+    # optional console summary
+    print('\n=== variable significance & drift summary ===')
+    print(f'model: {model_name}')
+    print(f'worst p dev : {worst_p_dev:.4g}')
+    print(f'worst p oot : {worst_p_oot:.4g}')
+    print(f'joint drift p: {p_joint:.4g}')
+    print(f'status      : {color}  {status}')
+    print('\nhighest p-values:')
+    print(offenders.round(4).to_string(index=False))
     
-    # show significance breakdown
-    significance_summary = calculations.groupby('significance_status')['parameter'].count()
-    print(f"\nSignificance Breakdown:")
-    for status, count in significance_summary.items():
-        print(f"  {status}: {count} variables")
-    
-    # show the actual worst performing variables
-    worst_variables = calculations.nlargest(5, 'p_value_dev')[['parameter', 'wald_chi_square_dev', 'p_value_dev', 'significance_status']]
-    
-    print(f"\nWorst performing variables (highest p-values):")
-    print(worst_variables.round(6))
-    
-    # also calculate wald chi-square for oot model for comparison
-    calculations['wald_chi_square_oot'] = (calculations['estimate_oot'] / calculations['std_error_oot']) ** 2
-    calculations['p_value_oot'] = 1 - stats.chi2.cdf(calculations['wald_chi_square_oot'], df=1)
-    
-    # return all results
-    results = {
-        'max_p_value': max_p_value,  # this is the single summary number
-        'overall_color_code': overall_color,
-        'overall_status': overall_status,
-        'significant_count': significant_count,
-        'total_parameters': total_params,
-        'significant_percentage': significant_pct,
-        'detailed_calculations': calculations,
-        'worst_variables': worst_variables,
-        'significance_summary': significance_summary,
-        'model_name': model_name
+    # return structured results
+    return {
+        'worst_p_dev'      : worst_p_dev,
+        'worst_p_oot'      : worst_p_oot,
+        'joint_drift_p'    : p_joint,
+        'color'            : color,
+        'status'           : status,
+        'details'          : df,
+        'top_offenders'    : offenders,
+        'model_name'       : model_name
     }
-    
-    return results
 
-# example usage:
-# significance_results = variable_significance(dev_model_results, oot_model_results, 'stage1_model')
+# example call:
+# vs_res = variable_significance(dev_model_results, oot_model_results, 'stage1_model')
