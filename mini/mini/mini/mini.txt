@@ -2,15 +2,15 @@
 
 ods graphics on;
 
-/* make lgd deciles once */
-proc rank data=&data groups=10 out=_lgd_base;
+/* make lgd deciles once (kept for reference if you need later) */
+proc rank data=&data groups=10 out=_base_lgd;
     var &dep;
     ranks _lgd_dec0;
 run;
 
-data _lgd_base;
-    set _lgd_base;
-    lgd_decile = _lgd_dec0 + 1; /* 1..10 where 1=low */
+data _base_lgd;
+    set _base_lgd;
+    lgd_decile = _lgd_dec0 + 1; /* 1..10 */
 run;
 
 %let i=1;
@@ -18,129 +18,73 @@ run;
 
 %do %while(%length(&v) > 0);
 
-    /* find type of var (num/char) */
+    /* get type and distinct count */
     proc sql noprint;
         select type
           into :_vtype trimmed
         from dictionary.columns
         where upcase(libname)='WORK'
-          and upcase(memname)='LGD_STAGE_ALL'
+          and upcase(memname)=upcase("%scan(&data,2,.)")
           and upcase(name)=upcase("&v");
     quit;
 
-    /* count distinct values */
     proc sql noprint;
         select count(distinct &v)
           into :_ndist trimmed
-        from _lgd_base;
+        from _base_lgd;
     quit;
 
-    %put NOTE: &v has &_ndist distinct values and type &_vtype;
+    %put NOTE: &v -> &_vtype with &_ndist distinct values;
 
-    /* case 1: low-cardinality (distinct < 10) -> simple bar of category percentages */
+    /* case 1: low-card vars -> barplot of % observations by category */
     %if %sysevalf(&_ndist < 10) %then %do;
-        title "pct of observations by &v";
-        proc sgplot data=_lgd_base;
-            vbar &v / stat=percent missing;
-            yaxis label="percent";
+        title "percent of observations by &v (dep=&dep)";
+        proc sgplot data=_base_lgd;
+            vbar &v / stat=percent missing datalabel;
+            yaxis label="percent of observations";
             xaxis label="&v";
         run;
         title;
     %end;
+
+    /* case 2: high-card numeric -> deciles + line plot of mean dep */
+    %else %if %upcase(&_vtype)=num %then %do;
+
+        /* rank into deciles */
+        proc rank data=_base_lgd groups=10 out=__r_&i;
+            var &v;
+            ranks _dec0;
+        run;
+
+        data __r_&i;
+            set __r_&i;
+            var_decile = _dec0 + 1; /* 1..10 */
+        run;
+
+        /* mean dep by decile */
+        proc means data=__r_&i nway noprint;
+            class var_decile;
+            var &dep;
+            output out=__mean_&i mean=avg_&dep n=n_obs;
+        run;
+
+        title "mean &dep by decile of &v";
+        proc sgplot data=__mean_&i;
+            series x=var_decile y=avg_&dep / markers;
+            xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
+            yaxis label="mean &dep";
+        run;
+        title;
+
+        /* clean temp for this variable */
+        proc datasets lib=work nolist;
+            delete __r_&i __mean_&i;
+        quit;
+    %end;
+
+    /* case 3: high-card character -> skip (no meaningful line plot) */
     %else %do;
-        /* case 2: high-cardinality -> deciles
-           note: if char with 10+ levels we can't "rank" sensibly; so we fallback to top-10 + other bar plot
-        */
-        %if %upcase(&_vtype)=num %then %do;
-            /* rank current variable into deciles */
-            proc rank data=_lgd_base groups=10 out=__tmp_rank;
-                var &v;
-                ranks var_dec0;
-            run;
-
-            data __tmp_rank;
-                set __tmp_rank;
-                var_decile = var_dec0 + 1; /* 1..10 */
-            run;
-
-            /* mean lgd by var decile */
-            proc means data=__tmp_rank noprint;
-                class var_decile;
-                var &dep;
-                output out=__mean (where=(_type_=1)) mean=avg_lgd n=n;
-            run;
-
-            title "mean &dep by decile of &v";
-            proc sgplot data=__mean;
-                series x=var_decile y=avg_lgd / markers;
-                xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
-                yaxis label="mean &dep";
-            run;
-            title;
-
-            /* cross-tab var_decile x lgd_decile with row % for heatmap */
-            ods exclude all;
-            ods output CrossTabFreqs=__xtab;
-            proc freq data=__tmp_rank;
-                tables var_decile*lgd_decile / norow nocol nopercent;
-            run;
-            ods select all;
-
-            data __heat;
-                set __xtab;
-                /* keep only cell rows */
-                if type='11';
-                row = var_decile;
-                col = lgd_decile;
-                rowpct = RowPercent;
-            run;
-
-            title "row % distribution of lgd deciles by &v decile";
-            proc sgplot data=__heat;
-                heatmapparm x=row y=col colorresponse=rowpct;
-                xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
-                yaxis integer values=(1 to 10 by 1) label="lgd decile (1=low)";
-            run;
-            title;
-
-            /* clean temps for this var */
-            proc datasets lib=work nolist;
-                delete __tmp_rank __mean __xtab __heat;
-            quit;
-        %end;
-        %else %do;
-            /* char variable with many levels: show top 10 categories by share + 'other' */
-            proc freq data=_lgd_base noprint;
-                tables &v / out=__cat (drop=percent);
-            run;
-
-            proc sort data=__cat; by descending count; run;
-
-            data __cat_top;
-                set __cat nobs=n;
-                if _n_ <= 10 then do; cat = &v; grp='top10'; output; end;
-                else do; cat='Other'; grp='other'; output; end;
-            run;
-
-            proc sql;
-                create table __cat_summarized as
-                select cat, sum(count) as count
-                from __cat_top
-                group by cat;
-            quit;
-
-            title "pct of observations by &v (top 10 categories + other)";
-            proc sgplot data=__cat_summarized;
-                vbar cat / response=count stat=percent;
-                yaxis label="percent";
-                xaxis label="&v (top 10 + other)";
-            run;
-            title;
-
-            proc datasets lib=work nolist;
-                delete __cat __cat_top __cat_summarized;
-            quit;
-        %end;
+        %put WARNING: &v is character with >=10 levels; skipping line plot.;
     %end;
 
     %let i=%eval(&i+1);
@@ -150,12 +94,12 @@ run;
 
 /* cleanup */
 proc datasets lib=work nolist;
-    delete _lgd_base;
+    delete _base_lgd;
 quit;
 
 ods graphics off;
 
 %mend;
 
-/* run it */
+/* run */
 %bivar_lgd36(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
