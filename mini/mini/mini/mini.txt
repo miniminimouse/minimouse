@@ -1,4 +1,4 @@
-%macro bivar_lgd36(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
+%macro bivar_analysis(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
 
 ods graphics on;
 
@@ -34,13 +34,16 @@ proc sql noprint;
     select count(distinct &v)
       into :_ndist trimmed
     from _base_lgd
-    where &v is not missing;  /* added: exclude missing values from count */
+    where &v is not missing;
 quit;
+
+/* convert to numeric to avoid character operand errors */
+%let _ndist = %eval(&_ndist + 0);
 
 %put NOTE: &v -> &_vtype with &_ndist distinct values;
 
 /* low cardinality - just do a simple bar chart showing distribution */
-%if %sysevalf(&_ndist < 10) %then %do;
+%if %eval(&_ndist < 10) %then %do;
     title "percent of observations by &v (dep=&dep)";
     proc sgplot data=_base_lgd;
         vbar &v / stat=percent missing datalabel;
