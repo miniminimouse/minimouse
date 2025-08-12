@@ -4,13 +4,13 @@ ods graphics on;
 
 /* make lgd deciles once - keeping this around in case we need it later */
 proc rank data=&data groups=10 out=_base_lgd;
-var &dep;
-ranks _lgd_dec0;
+    var &dep;
+    ranks _lgd_dec0;
 run;
 
 data _base_lgd;
-set _base_lgd;
-lgd_decile = _lgd_dec0 + 1; /* bumping to 1-10 range */
+    set _base_lgd;
+    lgd_decile = _lgd_dec0 + 1; /* bumping to 1-10 range */
 run;
 
 %let i=1;
@@ -18,91 +18,84 @@ run;
 
 %do %while(%length(&v) > 0);
 
-```
-/* figure out what type of variable we're dealing with */
-proc sql noprint;
-    select type
-      into :_vtype trimmed
-    from dictionary.columns
-    where upcase(libname)='WORK'
-      and upcase(memname)=upcase("%scan(&data,-1,.)")  /* fixed: get table name properly */
-      and upcase(name)=upcase("&v");
-quit;
-
-/* count how many unique values we have */
-proc sql noprint;
-    select count(distinct &v)
-      into :_ndist trimmed
-    from _base_lgd
-    where &v is not missing;
-quit;
-
-/* convert to numeric to avoid character operand errors */
-%let _ndist = %eval(&_ndist + 0);
-
-%put NOTE: &v -> &_vtype with &_ndist distinct values;
-
-/* low cardinality - just do a simple bar chart showing distribution */
-%if %eval(&_ndist < 10) %then %do;
-    title "percent of observations by &v (dep=&dep)";
-    proc sgplot data=_base_lgd;
-        vbar &v / stat=percent missing datalabel;
-        yaxis label="percent of observations";
-        xaxis label="&v";
-    run;
-    title;
-%end;
-
-/* high cardinality numeric - bin into deciles and show trend */
-%else %if %upcase(&_vtype) = N %then %do;  /* fixed: sas uses 'N' for numeric */
-
-    /* slice this variable into 10 buckets */
-    proc rank data=_base_lgd groups=10 out=__r_&i;
-        var &v;
-        ranks _dec0;
-    run;
-
-    data __r_&i;
-        set __r_&i;
-        var_decile = _dec0 + 1; /* make it 1-10 instead of 0-9 */
-    run;
-
-    /* calculate average dep variable for each bucket */
-    proc means data=__r_&i nway noprint;
-        class var_decile;
-        var &dep;
-        output out=__mean_&i mean=avg_&dep n=n_obs;
-    run;
-
-    title "mean &dep by decile of &v";
-    proc sgplot data=__mean_&i;
-        series x=var_decile y=avg_&dep / markers;
-        xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
-        yaxis label="mean &dep";
-    run;
-    title;
-
-    /* clean up temp datasets for this variable */
-    proc datasets lib=work nolist;
-        delete __r_&i __mean_&i;
+    /* figure out what type of variable we're dealing with */
+    proc sql noprint;
+        select type
+          into :_vtype trimmed
+        from dictionary.columns
+        where upcase(libname)='WORK'
+          and upcase(memname)=upcase("%scan(&data,-1,.)")  /* fixed: get table name properly */
+          and upcase(name)=upcase("&v");
     quit;
-%end;
 
-/* character variables with too many levels - not worth plotting */
-%else %do;
-    %put WARNING: &v is character with >=10 levels, skipping line plot;
-%end;
+    /* count how many unique values we have */
+    proc sql noprint;
+        select count(distinct &v)
+          into :_ndist trimmed
+        from _base_lgd
+        where &v is not missing;
+    quit;
+    
+    /* convert to numeric to avoid character operand errors */
+    %let _ndist = %eval(&_ndist + 0);
 
-/* move to next variable */
-%let i=%eval(&i+1);
-%let v=%scan(&vars,&i);
-```
+    %put NOTE: &v -> &_vtype with &_ndist distinct values;
+
+    /* low cardinality - simple bar chart showing distribution */
+    %if %eval(&_ndist < 10) %then %do;
+        title "Distribution of &v (dependent: &dep)";
+        proc sgplot data=_base_lgd;
+            vbar &v / stat=percent missing datalabel;
+            yaxis label="Percent of Observations";
+            xaxis label="&v";
+        run;
+        title;
+    %end;
+
+    /* high cardinality - bin into deciles and show relationship with dep variable */
+    %else %do;
+
+        /* slice this variable into 10 buckets */
+        proc rank data=_base_lgd groups=10 out=__r_&i;
+            var &v;
+            ranks _dec0;
+        run;
+
+        data __r_&i;
+            set __r_&i;
+            var_decile = _dec0 + 1; /* make it 1-10 instead of 0-9 */
+        run;
+
+        /* calculate average dep variable for each bucket */
+        proc means data=__r_&i nway noprint;
+            class var_decile;
+            var &dep;
+            output out=__mean_&i mean=avg_&dep n=n_obs;
+        run;
+
+        title "Relationship between &v and &dep (binned by deciles)";
+        proc sgplot data=__mean_&i;
+            series x=var_decile y=avg_&dep / markers;
+            xaxis integer values=(1 to 10 by 1) label="&v decile (1=lowest)";
+            yaxis label="Mean &dep";
+        run;
+        title;
+
+        /* clean up temp datasets for this variable */
+        proc datasets lib=work nolist;
+            delete __r_&i __mean_&i;
+        quit;
+    %end;
+
+    /* move to next variable */
+    %let i=%eval(&i+1);
+    %let v=%scan(&vars,&i);
 
 %end;
 
 /* cleanup main temp dataset */
 proc datasets lib=work nolist;
-delete _base_lgd;
+    delete _base_lgd;
 quit;
 
 ods graphics off;
