@@ -1,94 +1,161 @@
-import pandas as pd
-import numpy as np
-from scipy.stats import chi2   # chi-square cdf for p-values
-from numpy.linalg import inv
+%macro bivar_lgd36(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
 
-def variable_significance(dev_model_results, oot_model_results, model_name):
-    """
-    assesses variable significance and coefficient drift between
-    development and oot samples using wald chi-square tests
-    """
-    # --- pull models ---------------------------------------------------------
-    dev = dev_model_results[model_name]
-    oot = oot_model_results[model_name]
-    
-    # coefficients and ses
-    beta_d, se_d = dev.params, dev.bse
-    beta_o, se_o = oot.params, oot.bse
-    
-    # names – fall back if attribute missing
-    try:
-        names = dev.param_names
-    except AttributeError:
-        names = getattr(beta_d, 'index', pd.Index([f'param_{i}' for i in range(len(beta_d))]))
-    
-    # dataframe with per-sample wald stats & p-values -------------------------
-    df = pd.DataFrame({'param': names,
-                       'beta_dev': beta_d,
-                       'se_dev'  : se_d,
-                       'beta_oot': beta_o,
-                       'se_oot'  : se_o})
-    
-    df['wald_dev'] = (df['beta_dev'] / df['se_dev']) ** 2
-    df['p_dev']    = 1 - chi2.cdf(df['wald_dev'], 1)
-    
-    df['wald_oot'] = (df['beta_oot'] / df['se_oot']) ** 2
-    df['p_oot']    = 1 - chi2.cdf(df['wald_oot'], 1)
-    
-    # --- joint drift test ----------------------------------------------------
-    # difference vector and summed covariance matrix
-    delta = df['beta_dev'] - df['beta_oot']
-    
-    # try full cov matrices; if not available, use diagonal from bse^2
-    try:
-        cov_d = dev.cov_params()
-    except AttributeError:
-        cov_d = np.diag(se_d**2)
-    try:
-        cov_o = oot.cov_params()
-    except AttributeError:
-        cov_o = np.diag(se_o**2)
-    
-    var_diff = cov_d + cov_o
-    wald_joint = float(delta.T @ inv(var_diff) @ delta)
-    p_joint    = 1 - chi2.cdf(wald_joint, len(delta))
-    
-    # --- traffic-light logic --------------------------------------------------
-    worst_p_dev = df['p_dev'].max()
-    worst_p_oot = df['p_oot'].max()
-    
-    if (worst_p_dev < 0.04) and (worst_p_oot < 0.04) and (p_joint >= 0.05):
-        color, status = '🟢', 'all variables significant; no drift'
-    elif (worst_p_dev < 0.05) and (worst_p_oot < 0.05) and (p_joint >= 0.04):
-        color, status = '🟡', 'borderline'
-    else:
-        color, status = '🔴', 'insufficient significance or drift detected'
-    
-    # top five weakest variables (highest max-p across samples)
-    df['p_max'] = df[['p_dev', 'p_oot']].max(axis=1)
-    offenders = df.nlargest(5, 'p_max')[['param', 'p_dev', 'p_oot', 'p_max']]
-    
-    # optional console summary
-    print('\n=== variable significance & drift summary ===')
-    print(f'model: {model_name}')
-    print(f'worst p dev : {worst_p_dev:.4g}')
-    print(f'worst p oot : {worst_p_oot:.4g}')
-    print(f'joint drift p: {p_joint:.4g}')
-    print(f'status      : {color}  {status}')
-    print('\nhighest p-values:')
-    print(offenders.round(4).to_string(index=False))
-    
-    # return structured results
-    return {
-        'worst_p_dev'      : worst_p_dev,
-        'worst_p_oot'      : worst_p_oot,
-        'joint_drift_p'    : p_joint,
-        'color'            : color,
-        'status'           : status,
-        'details'          : df,
-        'top_offenders'    : offenders,
-        'model_name'       : model_name
-    }
+ods graphics on;
 
-# example call:
-# vs_res = variable_significance(dev_model_results, oot_model_results, 'stage1_model')
+/* make lgd deciles once */
+proc rank data=&data groups=10 out=_lgd_base;
+    var &dep;
+    ranks _lgd_dec0;
+run;
+
+data _lgd_base;
+    set _lgd_base;
+    lgd_decile = _lgd_dec0 + 1; /* 1..10 where 1=low */
+run;
+
+%let i=1;
+%let v=%scan(&vars,&i);
+
+%do %while(%length(&v) > 0);
+
+    /* find type of var (num/char) */
+    proc sql noprint;
+        select type
+          into :_vtype trimmed
+        from dictionary.columns
+        where upcase(libname)='WORK'
+          and upcase(memname)='LGD_STAGE_ALL'
+          and upcase(name)=upcase("&v");
+    quit;
+
+    /* count distinct values */
+    proc sql noprint;
+        select count(distinct &v)
+          into :_ndist trimmed
+        from _lgd_base;
+    quit;
+
+    %put NOTE: &v has &_ndist distinct values and type &_vtype;
+
+    /* case 1: low-cardinality (distinct < 10) -> simple bar of category percentages */
+    %if %sysevalf(&_ndist < 10) %then %do;
+        title "pct of observations by &v";
+        proc sgplot data=_lgd_base;
+            vbar &v / stat=percent missing;
+            yaxis label="percent";
+            xaxis label="&v";
+        run;
+        title;
+    %end;
+    %else %do;
+        /* case 2: high-cardinality -> deciles
+           note: if char with 10+ levels we can't "rank" sensibly; so we fallback to top-10 + other bar plot
+        */
+        %if %upcase(&_vtype)=num %then %do;
+            /* rank current variable into deciles */
+            proc rank data=_lgd_base groups=10 out=__tmp_rank;
+                var &v;
+                ranks var_dec0;
+            run;
+
+            data __tmp_rank;
+                set __tmp_rank;
+                var_decile = var_dec0 + 1; /* 1..10 */
+            run;
+
+            /* mean lgd by var decile */
+            proc means data=__tmp_rank noprint;
+                class var_decile;
+                var &dep;
+                output out=__mean (where=(_type_=1)) mean=avg_lgd n=n;
+            run;
+
+            title "mean &dep by decile of &v";
+            proc sgplot data=__mean;
+                series x=var_decile y=avg_lgd / markers;
+                xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
+                yaxis label="mean &dep";
+            run;
+            title;
+
+            /* cross-tab var_decile x lgd_decile with row % for heatmap */
+            ods exclude all;
+            ods output CrossTabFreqs=__xtab;
+            proc freq data=__tmp_rank;
+                tables var_decile*lgd_decile / norow nocol nopercent;
+            run;
+            ods select all;
+
+            data __heat;
+                set __xtab;
+                /* keep only cell rows */
+                if type='11';
+                row = var_decile;
+                col = lgd_decile;
+                rowpct = RowPercent;
+            run;
+
+            title "row % distribution of lgd deciles by &v decile";
+            proc sgplot data=__heat;
+                heatmapparm x=row y=col colorresponse=rowpct;
+                xaxis integer values=(1 to 10 by 1) label="&v decile (1=low)";
+                yaxis integer values=(1 to 10 by 1) label="lgd decile (1=low)";
+            run;
+            title;
+
+            /* clean temps for this var */
+            proc datasets lib=work nolist;
+                delete __tmp_rank __mean __xtab __heat;
+            quit;
+        %end;
+        %else %do;
+            /* char variable with many levels: show top 10 categories by share + 'other' */
+            proc freq data=_lgd_base noprint;
+                tables &v / out=__cat (drop=percent);
+            run;
+
+            proc sort data=__cat; by descending count; run;
+
+            data __cat_top;
+                set __cat nobs=n;
+                if _n_ <= 10 then do; cat = &v; grp='top10'; output; end;
+                else do; cat='Other'; grp='other'; output; end;
+            run;
+
+            proc sql;
+                create table __cat_summarized as
+                select cat, sum(count) as count
+                from __cat_top
+                group by cat;
+            quit;
+
+            title "pct of observations by &v (top 10 categories + other)";
+            proc sgplot data=__cat_summarized;
+                vbar cat / response=count stat=percent;
+                yaxis label="percent";
+                xaxis label="&v (top 10 + other)";
+            run;
+            title;
+
+            proc datasets lib=work nolist;
+                delete __cat __cat_top __cat_summarized;
+            quit;
+        %end;
+    %end;
+
+    %let i=%eval(&i+1);
+    %let v=%scan(&vars,&i);
+
+%end;
+
+/* cleanup */
+proc datasets lib=work nolist;
+    delete _lgd_base;
+quit;
+
+ods graphics off;
+
+%mend;
+
+/* run it */
+%bivar_lgd36(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
