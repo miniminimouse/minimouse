@@ -1,56 +1,153 @@
-/* set your table/variable here */
-%let data = work.lgd_stage_all;
-%let var  = REFR_LTV;   /* change to any numeric var you want to inspect */
+%macro stationarity_test(data=, var_list=);
 
-/* show ods table names in the log */
-ods trace on / listing;
-
-/* capture the three stationarity tables into work */
-ods output ADF        = _adf_view;
-proc autoreg data=&data;
-  model &var = / stationarity=(adf=(0 1 2 3));
+/* init empty summary */
+data _summary_all;
+  length variable $32 test_type $8 specification $40 stat_name $8;
+  stop;
 run;
 
-ods output PhilPerron = _pp_view;
-proc autoreg data=&data;
-  model &var = / stationarity=(pp);
+/* parse lib.mem */
+%let _lib = %upcase(%scan(&data,1,.));
+%let _mem = %upcase(%scan(&data,2,.));
+%if "&_mem" = "" %then %do; %let _mem=&_lib; %let _lib=WORK; %end;
+
+%let i=1;
+%let var=%scan(&var_list,&i);
+
+%do %while(%length(&var) > 0);
+
+  /* type + cardinality */
+  proc sql noprint;
+    select type into :_vtype trimmed
+    from dictionary.columns
+    where upcase(libname)="&_lib"
+      and upcase(memname)="&_mem"
+      and upcase(name)=upcase("&var");
+  quit;
+
+  proc sql noprint;
+    select count(distinct &var)
+      into :_ndist trimmed
+    from &data
+    where &var is not missing;
+  quit;
+
+  %if %upcase(&_vtype) ne NUM %then %do; %put WARNING: &var not numeric, skip.; %goto next; %end;
+  %if %eval(&_ndist < 10) %then %do; %put WARNING: &var only &_ndist distinct, skip.; %goto next; %end;
+
+  %put NOTE: running adf/pp/kpss for &var;
+
+  /* run and capture */
+  ods output ADF=_adf_&i;
+  proc autoreg data=&data;
+    model &var = / stationarity=(adf=(0 1 2 3));
+  run;
+
+  ods output PhilPerron=_pp_&i;
+  proc autoreg data=&data;
+    model &var = / stationarity=(pp);
+  run;
+
+  ods output KPSS=_kpss_&i;
+  proc autoreg data=&data;
+    model &var = / stationarity=(kpss=(kernel=qs auto));
+  run;
+
+  /* print intermediates (keep it simple to avoid missing cols) */
+  title "ADF table for &var";
+  proc print data=_adf_&i noobs label;
+    var Type Lags Rho Tau ProbTau;
+    format ProbTau pvalue8.4;
+  run;
+
+  title "Phillips-Perron table for &var";
+  proc print data=_pp_&i noobs label;
+    var Type Lags Rho Tau ProbTau;
+    format ProbTau pvalue8.4;
+  run;
+
+  title "KPSS table for &var";
+  proc print data=_kpss_&i noobs label;
+    var Type Lags Eta Prob;
+    format Prob pvalue8.4;
+  run;
+  title;
+
+  /* convert to tidy long */
+
+  /* adf -> tau and ProbTau */
+  %if %sysfunc(exist(_adf_&i)) %then %do;
+    data _adf_long;
+      set _adf_&i;
+      length variable $32 test_type $8 specification $40 stat_name $8;
+      variable="&var";
+      test_type="ADF";
+      specification=cats(strip(type),' lag',put(lags,best.));
+      stat_name='tau';
+      stat_value=tau;
+      pvalue=ProbTau;
+      keep variable test_type specification lags stat_name stat_value pvalue;
+    run;
+  %end;
+
+  /* pp -> tau and ProbTau */
+  %if %sysfunc(exist(_pp_&i)) %then %do;
+    data _pp_long;
+      set _pp_&i;
+      length variable $32 test_type $8 specification $40 stat_name $8;
+      variable="&var";
+      test_type="PP";
+      specification=strip(type);
+      stat_name='tau';
+      stat_value=tau;
+      pvalue=ProbTau;
+      keep variable test_type specification lags stat_name stat_value pvalue;
+    run;
+  %end;
+
+  /* kpss -> eta and Prob */
+  %if %sysfunc(exist(_kpss_&i)) %then %do;
+    data _kpss_long;
+      set _kpss_&i;
+      length variable $32 test_type $8 specification $40 stat_name $8;
+      variable="&var";
+      test_type="KPSS";
+      specification=strip(type);
+      stat_name='eta';
+      stat_value=eta;
+      pvalue=Prob;
+      keep variable test_type specification lags stat_name stat_value pvalue;
+    run;
+  %end;
+
+  /* stack */
+  data _summary_all;
+    set _summary_all
+        %sysfunc(ifc(%sysfunc(exist(_adf_long)),_adf_long,))
+        %sysfunc(ifc(%sysfunc(exist(_pp_long)),_pp_long,))
+        %sysfunc(ifc(%sysfunc(exist(_kpss_long)),_kpss_long,));
+  run;
+
+  /* clean temps for this var */
+  proc datasets lib=work nolist;
+    delete _adf_&i _pp_&i _kpss_&i _adf_long _pp_long _kpss_long;
+  quit;
+
+%next:
+  %let i=%eval(&i+1);
+  %let var=%scan(&var_list,&i);
+%end;
+
+/* final summary print */
+proc sort data=_summary_all; by variable test_type specification lags; run;
+title "stationarity tests summary";
+title2 "adf && pp: stat=tau (p: ProbTau) | kpss: stat=eta (p: Prob)";
+proc print data=_summary_all noobs label;
+  var variable test_type specification lags stat_name stat_value pvalue;
+  label variable="variable" test_type="test" specification="spec"
+        lags="lags" stat_name="stat" stat_value="stat value" pvalue="p-value";
+  format stat_value 12.4 pvalue pvalue8.4;
 run;
-
-ods output KPSS       = _kpss_view;
-proc autoreg data=&data;
-  model &var = / stationarity=(kpss=(kernel=qs auto));
-run;
-
-ods trace off;
-
-/* peek columns, types, and labels so you can find the p-value column names */
-title "columns + labels in _ADF_VIEW";
-proc contents data=_adf_view varnum; run;
-proc sql;
-  select name, label, type, length, format
-  from dictionary.columns
-  where upcase(libname)='WORK' and upcase(memname)='_ADF_VIEW'
-  order by varnum;
-quit;
-proc print data=_adf_view(obs=10) label; run;
-
-title "columns + labels in _PP_VIEW";
-proc contents data=_pp_view varnum; run;
-proc sql;
-  select name, label, type, length, format
-  from dictionary.columns
-  where upcase(libname)='WORK' and upcase(memname)='_PP_VIEW'
-  order by varnum;
-quit;
-proc print data=_pp_view(obs=10) label; run;
-
-title "columns + labels in _KPSS_VIEW";
-proc contents data=_kpss_view varnum; run;
-proc sql;
-  select name, label, type, length, format
-  from dictionary.columns
-  where upcase(libname)='WORK' and upcase(memname)='_KPSS_VIEW'
-  order by varnum;
-quit;
-proc print data=_kpss_view(obs=10) label; run;
 title;
+
+%mend;
