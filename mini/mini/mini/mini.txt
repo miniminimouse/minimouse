@@ -1,4 +1,11 @@
-%macro stationarity_test(data=, var_list=);
+%macro stationarity_test(data=, date=, var_list=);
+
+/* make a time series: mean by date (one row per &date) */
+proc means data=&data nway noprint;
+  class &date;
+  var &var_list;
+  output out=work.__ts_means (drop=_type_ _freq_) mean=;
+run;
 
 /* init empty summary */
 data _summary_all;
@@ -6,17 +13,17 @@ data _summary_all;
   stop;
 run;
 
-/* parse lib.mem */
-%let _lib = %upcase(%scan(&data,1,.));
-%let _mem = %upcase(%scan(&data,2,.));
-%if "&_mem" = "" %then %do; %let _mem=&_lib; %let _lib=WORK; %end;
+/* we will test on the date-level means */
+%let _ts = work.__ts_means;
+%let _lib = WORK;
+%let _mem = __TS_MEANS;
 
 %let i=1;
 %let var=%scan(&var_list,&i);
 
 %do %while(%length(&var) > 0);
 
-  /* type + cardinality */
+  /* type + cardinality on the aggregated table */
   proc sql noprint;
     select type into :_vtype trimmed
     from dictionary.columns
@@ -28,94 +35,70 @@ run;
   proc sql noprint;
     select count(distinct &var)
       into :_ndist trimmed
-    from &data
+    from &_ts
     where &var is not missing;
   quit;
 
-  %if %upcase(&_vtype) ne NUM %then %do; %put WARNING: &var not numeric, skip.; %goto next; %end;
-  %if %eval(&_ndist < 10) %then %do; %put WARNING: &var only &_ndist distinct, skip.; %goto next; %end;
+  %if %upcase(&_vtype) ne NUM %then %do; %put WARNING: &var not numeric after mean-by-date, skip.; %goto next; %end;
+  %if %eval(&_ndist < 10) %then %do; %put WARNING: &var only &_ndist distinct at date level, skip.; %goto next; %end;
 
-  %put NOTE: running adf/pp/kpss for &var;
+  %put NOTE: running adf/pp/kpss for &var on date-level means;
 
   /* run and capture */
   ods output ADF=_adf_&i;
-  proc autoreg data=&data;
+  proc autoreg data=&_ts;
     model &var = / stationarity=(adf=(0 1 2 3));
   run;
 
   ods output PhilPerron=_pp_&i;
-  proc autoreg data=&data;
+  proc autoreg data=&_ts;
     model &var = / stationarity=(pp);
   run;
 
   ods output KPSS=_kpss_&i;
-  proc autoreg data=&data;
+  proc autoreg data=&_ts;
     model &var = / stationarity=(kpss=(kernel=qs auto));
   run;
 
-  /* print intermediates (keep it simple to avoid missing cols) */
-  title "ADF table for &var";
-  proc print data=_adf_&i noobs label;
-    var Type Lags Rho Tau ProbTau;
-    format ProbTau pvalue8.4;
-  run;
-
-  title "Phillips-Perron table for &var";
-  proc print data=_pp_&i noobs label;
-    var Type Lags Rho Tau ProbTau;
-    format ProbTau pvalue8.4;
-  run;
-
-  title "KPSS table for &var";
-  proc print data=_kpss_&i noobs label;
-    var Type Lags Eta Prob;
-    format Prob pvalue8.4;
-  run;
+  /* quick peek of intermediates */
+  title "ADF table for &var (date-level means)";
+  proc print data=_adf_&i noobs label; var Type Lags Rho Tau ProbTau; format ProbTau pvalue8.4; run;
+  title "PP table for &var (date-level means)";
+  proc print data=_pp_&i  noobs label; var Type Lags Rho Tau ProbTau; format ProbTau pvalue8.4; run;
+  title "KPSS table for &var (date-level means)";
+  proc print data=_kpss_&i noobs label; var Type Lags Eta Prob;     format Prob    pvalue8.4; run;
   title;
 
-  /* convert to tidy long */
-
-  /* adf -> tau and ProbTau */
+  /* tidy long */
   %if %sysfunc(exist(_adf_&i)) %then %do;
     data _adf_long;
       set _adf_&i;
       length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="ADF";
+      variable="&var"; test_type="ADF";
       specification=cats(strip(type),' lag',put(lags,best.));
-      stat_name='tau';
-      stat_value=tau;
-      pvalue=ProbTau;
+      stat_name='tau'; stat_value=tau; pvalue=ProbTau;
       keep variable test_type specification lags stat_name stat_value pvalue;
     run;
   %end;
 
-  /* pp -> tau and ProbTau */
   %if %sysfunc(exist(_pp_&i)) %then %do;
     data _pp_long;
       set _pp_&i;
       length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="PP";
+      variable="&var"; test_type="PP";
       specification=strip(type);
-      stat_name='tau';
-      stat_value=tau;
-      pvalue=ProbTau;
+      stat_name='tau'; stat_value=tau; pvalue=ProbTau;
       keep variable test_type specification lags stat_name stat_value pvalue;
     run;
   %end;
 
-  /* kpss -> eta and Prob */
   %if %sysfunc(exist(_kpss_&i)) %then %do;
     data _kpss_long;
       set _kpss_&i;
       length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="KPSS";
+      variable="&var"; test_type="KPSS";
       specification=strip(type);
-      stat_name='eta';
-      stat_value=eta;
-      pvalue=Prob;
+      stat_name='eta'; stat_value=eta; pvalue=Prob;
       keep variable test_type specification lags stat_name stat_value pvalue;
     run;
   %end;
@@ -128,7 +111,7 @@ run;
         %sysfunc(ifc(%sysfunc(exist(_kpss_long)),_kpss_long,));
   run;
 
-  /* clean temps for this var */
+  /* clean temps */
   proc datasets lib=work nolist;
     delete _adf_&i _pp_&i _kpss_&i _adf_long _pp_long _kpss_long;
   quit;
@@ -138,9 +121,9 @@ run;
   %let var=%scan(&var_list,&i);
 %end;
 
-/* final summary print */
+/* final summary */
 proc sort data=_summary_all; by variable test_type specification lags; run;
-title "stationarity tests summary";
+title "stationarity tests summary (means by &date)";
 title2 "adf && pp: stat=tau (p: ProbTau) | kpss: stat=eta (p: Prob)";
 proc print data=_summary_all noobs label;
   var variable test_type specification lags stat_name stat_value pvalue;
@@ -149,5 +132,9 @@ proc print data=_summary_all noobs label;
   format stat_value 12.4 pvalue pvalue8.4;
 run;
 title;
+
+/* optional: show first few rows of the aggregated series */
+title "date-level means preview";
+proc print data=&_ts (obs=10); run; title;
 
 %mend;
