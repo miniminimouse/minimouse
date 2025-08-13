@@ -1,6 +1,6 @@
 %macro stationarity_test(data=, var_list=);
 
-/* init empty summary */
+/* init */
 data _summary_all;
   length variable $32 test_type $8 specification $40 stat_name $8;
   stop;
@@ -11,12 +11,29 @@ run;
 %let _mem = %upcase(%scan(&data,2,.));
 %if "&_mem" = "" %then %do; %let _mem=&_lib; %let _lib=WORK; %end;
 
+/* helper: get the var NAME whose LABEL matches a regex like "Pr < Tau" or "Pr > Eta" */
+%macro _pcol_from_label(ds=, label_regex=, out=);
+  /* default to blank */
+  %let &out=;
+  proc sql noprint;
+    select name
+      into :&out trimmed
+    from dictionary.columns
+    where upcase(libname)='WORK'
+      and upcase(memname)=upcase("&ds")
+      /* match on label, ignore spaces/case: e.g., "Pr < Tau" */
+      and prxmatch("/&label_regex/i", coalescec(label,' '))>0
+    ;
+  quit;
+%mend;
+
+/* loop vars */
 %let i=1;
 %let var=%scan(&var_list,&i);
 
 %do %while(%length(&var) > 0);
 
-  /* type + cardinality */
+  /* type + distinct */
   proc sql noprint;
     select type into :_vtype trimmed
     from dictionary.columns
@@ -26,8 +43,7 @@ run;
   quit;
 
   proc sql noprint;
-    select count(distinct &var)
-      into :_ndist trimmed
+    select count(distinct &var) into :_ndist trimmed
     from &data
     where &var is not missing;
   quit;
@@ -35,9 +51,7 @@ run;
   %if %upcase(&_vtype) ne NUM %then %do; %put WARNING: &var not numeric, skip.; %goto next; %end;
   %if %eval(&_ndist < 10) %then %do; %put WARNING: &var only &_ndist distinct, skip.; %goto next; %end;
 
-  %put NOTE: running adf/pp/kpss for &var;
-
-  /* run and capture */
+  /* run tests + capture */
   ods output ADF=_adf_&i;
   proc autoreg data=&data;
     model &var = / stationarity=(adf=(0 1 2 3));
@@ -53,71 +67,75 @@ run;
     model &var = / stationarity=(kpss=(kernel=qs auto));
   run;
 
-  /* print intermediates so you can see what we stacked */
-  title "ADF table for &var";
-  proc print data=_adf_&i noobs;
-    var Type Lags Rho 'Pr < Rho'n Tau 'Pr < Tau'n F 'Pr > F'n;
-    format 'Pr < Rho'n 'Pr < Tau'n 'Pr > F'n pvalue8.4;
-  run;
+  /* find p columns by LABEL (this is the key fix) */
+  %_pcol_from_label(ds=_ADF_&i,   label_regex=^\s*PR\s*<\s*TAU\s*$, out=_adf_pcol);
+  %_pcol_from_label(ds=_PP_&i,    label_regex=^\s*PR\s*<\s*TAU\s*$, out=_pp_pcol);
+  %_pcol_from_label(ds=_KPSS_&i,  label_regex=^\s*PR\s*>\s*ETA\s*$, out=_kpss_pcol);
 
-  title "Phillips-Perron table for &var";
-  proc print data=_pp_&i noobs;
-    var Type Lags Rho 'Pr < Rho'n Tau 'Pr < Tau'n;
-    format 'Pr < Rho'n 'Pr < Tau'n pvalue8.4;
-  run;
+  /* print intermediates using the resolved column names */
+  %if %sysfunc(exist(_adf_&i)) %then %do;
+    title "ADF table for &var";
+    proc print data=_adf_&i noobs;
+      var Type Lags Rho Tau %sysfunc(coalescec(&_adf_pcol,));
+    run;
+  %end;
 
-  title "KPSS table for &var";
-  proc print data=_kpss_&i noobs;
-    var Type Lags Eta 'Pr > Eta'n;
-    format 'Pr > Eta'n pvalue8.4;
-  run;
+  %if %sysfunc(exist(_pp_&i)) %then %do;
+    title "Phillips-Perron table for &var";
+    proc print data=_pp_&i noobs;
+      var Type Lags Rho Tau %sysfunc(coalescec(&_pp_pcol,));
+    run;
+  %end;
+
+  %if %sysfunc(exist(_kpss_&i)) %then %do;
+    title "KPSS table for &var";
+    proc print data=_kpss_&i noobs;
+      var Type Lags Eta %sysfunc(coalescec(&_kpss_pcol,));
+    run;
+  %end;
   title;
 
-  /* convert to tidy long using name-literals for p columns */
-
-  /* adf -> tau and 'Pr < Tau' */
+  /* tidy long: use the resolved p-value column names in sql select */
   %if %sysfunc(exist(_adf_&i)) %then %do;
-    data _adf_long;
-      set _adf_&i;
-      length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="ADF";
-      specification=cats(strip(type),' lag',put(lags,best.));
-      stat_name='tau';
-      stat_value=tau;
-      pvalue='Pr < Tau'n;  /* <- this was the missing piece */
-      keep variable test_type specification lags stat_name stat_value pvalue;
-    run;
+    proc sql;
+      create table _adf_long as
+      select "&var" length=32 as variable,
+             'ADF'  length=8  as test_type,
+             cats(strip(type),' lag',put(lags,best.)) length=40 as specification,
+             lags,
+             'tau' length=8   as stat_name,
+             tau    as stat_value,
+             %sysfunc(coalescec(&_adf_pcol,.)) as pvalue
+      from _adf_&i;
+    quit;
   %end;
 
-  /* pp -> tau and 'Pr < Tau' */
   %if %sysfunc(exist(_pp_&i)) %then %do;
-    data _pp_long;
-      set _pp_&i;
-      length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="PP";
-      specification=strip(type);
-      stat_name='tau';
-      stat_value=tau;
-      pvalue='Pr < Tau'n;
-      keep variable test_type specification lags stat_name stat_value pvalue;
-    run;
+    proc sql;
+      create table _pp_long as
+      select "&var" length=32 as variable,
+             'PP'   length=8  as test_type,
+             strip(type)      as specification length=40,
+             lags,
+             'tau' length=8   as stat_name,
+             tau    as stat_value,
+             %sysfunc(coalescec(&_pp_pcol,.)) as pvalue
+      from _pp_&i;
+    quit;
   %end;
 
-  /* kpss -> eta and 'Pr > Eta' */
   %if %sysfunc(exist(_kpss_&i)) %then %do;
-    data _kpss_long;
-      set _kpss_&i;
-      length variable $32 test_type $8 specification $40 stat_name $8;
-      variable="&var";
-      test_type="KPSS";
-      specification=strip(type);
-      stat_name='eta';
-      stat_value=eta;
-      pvalue='Pr > Eta'n;
-      keep variable test_type specification lags stat_name stat_value pvalue;
-    run;
+    proc sql;
+      create table _kpss_long as
+      select "&var" length=32 as variable,
+             'KPSS' length=8  as test_type,
+             strip(type)      as specification length=40,
+             lags,
+             'eta' length=8   as stat_name,
+             eta    as stat_value,
+             %sysfunc(coalescec(&_kpss_pcol,.)) as pvalue
+      from _kpss_&i;
+    quit;
   %end;
 
   /* stack */
@@ -128,7 +146,7 @@ run;
         %sysfunc(ifc(%sysfunc(exist(_kpss_long)),_kpss_long,));
   run;
 
-  /* clean temps for this var */
+  /* clean temp */
   proc datasets lib=work nolist;
     delete _adf_&i _pp_&i _kpss_&i _adf_long _pp_long _kpss_long;
   quit;
@@ -138,10 +156,10 @@ run;
   %let var=%scan(&var_list,&i);
 %end;
 
-/* final summary print */
+/* final print */
 proc sort data=_summary_all; by variable test_type specification lags; run;
 title "stationarity tests summary";
-title2 "adf && pp: stat=tau (p: 'Pr < Tau') | kpss: stat=eta (p: 'Pr > Eta')";
+title2 "adf && pp: stat=tau (p from label 'Pr < Tau') | kpss: stat=eta (p from label 'Pr > Eta')";
 proc print data=_summary_all noobs label;
   var variable test_type specification lags stat_name stat_value pvalue;
   label variable="variable" test_type="test" specification="spec"
