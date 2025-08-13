@@ -1,103 +1,147 @@
-%macro bivar_analysis(data=work.lgd_stage_all, dep=lgd_36m, vars=&stage1_var);
+%macro stationarity_test(data=, var_list=);
 
-ods graphics on;
-
-/* make lgd deciles once - keeping this around in case we need it later */
-proc rank data=&data groups=10 out=_base_lgd;
-    var &dep;
-    ranks _lgd_dec0;
-run;
-
-data _base_lgd;
-    set _base_lgd;
-    lgd_decile = _lgd_dec0 + 1; /* bumping to 1-10 range */
+/* initialize results dataset to store p-values */
+data _test_results;
+length variable $32 adf_pvalue pp_pvalue kpss_pvalue 8;
+delete;
 run;
 
 %let i=1;
-%let v=%scan(&vars,&i);
+%let var=%scan(&var_list,&i);
 
-%do %while(%length(&v) > 0);
+%do %while(%length(&var) > 0);
 
-    /* figure out what type of variable we're dealing with */
-    proc sql noprint;
-        select type
-          into :_vtype trimmed
-        from dictionary.columns
-        where upcase(libname)='WORK'
-          and upcase(memname)=upcase("%scan(&data,-1,.)")  /* fixed: get table name properly */
-          and upcase(name)=upcase("&v");
-    quit;
+%put NOTE: running stationarity tests for &var;
 
-    /* count how many unique values we have */
-    proc sql noprint;
-        select count(distinct &v)
-          into :_ndist trimmed
-        from _base_lgd
-        where &v is not missing;
-    quit;
+/* augmented dickey-fuller test */
+title "Augmented Dickey-Fuller Test for &var";
+proc autoreg data=&data;
+    model &var = / stationarity=(adf=(0,1,2,3,4));
+    ods output stationarity=_adf_&i;
+run;
+title;
+
+/* phillips-perron test */
+title "Phillips-Perron Test for &var";
+proc autoreg data=&data;
+    model &var = / stationarity=(pp);
+    ods output stationarity=_pp_&i;
+run;
+title;
+
+/* kpss test */
+title "KPSS Test for &var";
+proc autoreg data=&data;
+    model &var = / stationarity=(kpss);
+    ods output stationarity=_kpss_&i;
+run;
+title;
+
+/* extract p-values and store them */
+data _temp_result;
+    length variable $32;
+    variable = "&var";
     
-    /* convert to numeric to avoid character operand errors */
-    %let _ndist = %eval(&_ndist + 0);
+    /* get adf p-value - usually the first lag with lowest p-value */
+    set _adf_&i;
+    if _n_ = 1;
+    adf_pvalue = prob;
+    keep variable adf_pvalue;
+run;
 
-    %put NOTE: &v -> &_vtype with &_ndist distinct values;
+/* add pp p-value */
+data _temp_result;
+    merge _temp_result (in=a) _pp_&i (keep=prob rename=(prob=pp_pvalue));
+    if a;
+run;
 
-    /* low cardinality - simple bar chart showing distribution */
-    %if %eval(&_ndist < 10) %then %do;
-        title "Distribution of &v (dependent: &dep)";
-        proc sgplot data=_base_lgd;
-            vbar &v / stat=percent missing datalabel;
-            yaxis label="Percent of Observations";
-            xaxis label="&v";
-        run;
-        title;
-    %end;
+/* add kpss p-value */
+data _temp_result;
+    merge _temp_result (in=a) _kpss_&i (keep=prob rename=(prob=kpss_pvalue));
+    if a;
+run;
 
-    /* high cardinality - bin into deciles and show relationship with dep variable */
-    %else %do;
+/* append to main results */
+data _test_results;
+    set _test_results _temp_result;
+run;
 
-        /* slice this variable into 10 buckets */
-        proc rank data=_base_lgd groups=10 out=__r_&i;
-            var &v;
-            ranks _dec0;
-        run;
+/* clean up temp datasets */
+proc datasets lib=work nolist;
+    delete _adf_&i _pp_&i _kpss_&i _temp_result;
+quit;
 
-        data __r_&i;
-            set __r_&i;
-            var_decile = _dec0 + 1; /* make it 1-10 instead of 0-9 */
-        run;
-
-        /* calculate average dep variable for each bucket */
-        proc means data=__r_&i nway noprint;
-            class var_decile;
-            var &dep;
-            output out=__mean_&i mean=avg_&dep n=n_obs;
-        run;
-
-        title "Relationship between &v and &dep (binned by deciles)";
-        proc sgplot data=__mean_&i;
-            series x=var_decile y=avg_&dep / markers;
-            xaxis integer values=(1 to 10 by 1) label="&v decile (1=lowest)";
-            yaxis label="Mean &dep";
-        run;
-        title;
-
-        /* clean up temp datasets for this variable */
-        proc datasets lib=work nolist;
-            delete __r_&i __mean_&i;
-        quit;
-    %end;
-
-    /* move to next variable */
-    %let i=%eval(&i+1);
-    %let v=%scan(&vars,&i);
+%let i=%eval(&i+1);
+%let var=%scan(&var_list,&i);
 
 %end;
 
-/* cleanup main temp dataset */
-proc datasets lib=work nolist;
-    delete _base_lgd;
-quit;
+/* create summary table with null hypotheses */
+data _summary_table;
+set _test_results;
 
-ods graphics off;
+/* format p-values nicely */
+format adf_pvalue pp_pvalue kpss_pvalue 6.4;
+
+run;
+
+/* add header row with null hypotheses */
+data _summary_with_headers;
+length variable $32;
+
+/* header row */
+variable = "NULL HYPOTHESIS:";
+adf_pvalue = .;
+pp_pvalue = .;  
+kpss_pvalue = .;
+output;
+
+variable = "Series has unit root";
+adf_pvalue = .;
+pp_pvalue = .;
+kpss_pvalue = .;
+output;
+
+variable = "(non-stationary)";
+adf_pvalue = .;
+pp_pvalue = .;
+kpss_pvalue = .;
+output;
+
+variable = " ";
+adf_pvalue = .;
+pp_pvalue = .;
+kpss_pvalue = .;
+output;
+
+/* add the actual results */
+set _summary_table;
+
+run;
+
+/* print the summary table */
+title “Stationarity Tests Summary - P-Values”;
+title2 “ADF & PP: H0 = unit root (non-stationary) | KPSS: H0 = stationary”;
+proc print data=_summary_with_headers noobs;
+var variable adf_pvalue pp_pvalue kpss_pvalue;
+label variable=“Variable”
+adf_pvalue=“ADF p-value”
+pp_pvalue=“PP p-value”
+kpss_pvalue=“KPSS p-value”;
+run;
+title;
+
+/* interpretation note */
+data *null*;
+put “NOTE: Interpretation Guide:”;
+put “NOTE: ADF & PP tests - if p < 0.05, reject H0 (series is stationary)”;
+put “NOTE: KPSS test - if p < 0.05, reject H0 (series is non-stationary)”;
+put “NOTE: For stationarity: want ADF & PP p-values < 0.05 AND KPSS p-value > 0.05”;
+run;
+
+/* clean up */
+proc datasets lib=work nolist;
+delete _test_results _summary_table _summary_with_headers;
+quit;
 
 %mend;
