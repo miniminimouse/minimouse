@@ -1,23 +1,31 @@
 %macro stationarity_test(data=, var_list=);
 
-/* initialize results dataset to store p-values */
+/* initialize results dataset to store p-values - use STOP not DELETE */
 data _test_results;
     length variable $32 adf_pvalue pp_pvalue kpss_pvalue 8;
-    delete;
+    stop;
 run;
+
+/* robust library/member parsing */
+%let _lib = %upcase(%scan(&data,1,.));
+%let _mem = %upcase(%scan(&data,2,.));
+%if "&_mem" = "" %then %do; 
+    %let _mem=&_lib; 
+    %let _lib=WORK; 
+%end;
 
 %let i=1;
 %let var=%scan(&var_list,&i);
 
 %do %while(%length(&var) > 0);
     
-    /* check if variable is numeric */
+    /* check if variable is numeric using correct library/member */
     proc sql noprint;
         select type
           into :_vtype trimmed
         from dictionary.columns
-        where upcase(libname)='WORK'
-          and upcase(memname)=upcase("%scan(&data,-1,.)")
+        where upcase(libname)="&_lib"
+          and upcase(memname)="&_mem"
           and upcase(name)=upcase("&var");
     quit;
     
@@ -34,8 +42,8 @@ run;
     
     %put NOTE: &var -> &_vtype with &_ndist distinct values;
     
-    /* skip if not numeric or less than 10 unique values */
-    %if %upcase(&_vtype) ne N %then %do;
+    /* skip if not numeric or less than 10 unique values - use NUM not N */
+    %if %upcase(&_vtype) ne NUM %then %do;
         %put WARNING: skipping &var - not numeric;
     %end;
     %else %if %eval(&_ndist < 10) %then %do;
@@ -43,54 +51,88 @@ run;
     %end;
     %else %do;
         %put NOTE: running stationarity tests for &var;
-    
-        /* augmented dickey-fuller test */
+        
+        /* augmented dickey-fuller test - correct ODS table name and syntax */
         title "Augmented Dickey-Fuller Test for &var";
         proc autoreg data=&data;
-            model &var = / stationarity=(adf=(0,1,2,3,4));
-            ods output stationarity=_adf_&i;
+            model &var = / stationarity=(adf=(0 1 2 3));
+            ods output ADF=_adf_&i;
         run;
         title;
         
-        /* phillips-perron test */
+        /* phillips-perron test - correct ODS table name */
         title "Phillips-Perron Test for &var";
         proc autoreg data=&data;
             model &var = / stationarity=(pp);
-            ods output stationarity=_pp_&i;
+            ods output PhilPerron=_pp_&i;
         run;
         title;
         
-        /* kpss test */
+        /* kpss test - correct ODS table name */
         title "KPSS Test for &var";
         proc autoreg data=&data;
-            model &var = / stationarity=(kpss);
-            ods output stationarity=_kpss_&i;
+            model &var = / stationarity=(kpss=(kernel=qs auto));
+            ods output KPSS=_kpss_&i;
         run;
         title;
         
-        /* extract p-values and store them */
+        /* extract p-values - handle different column names per test */
         data _temp_result;
             length variable $32;
             variable = "&var";
+            adf_pvalue = .;
+            pp_pvalue = .;
+            kpss_pvalue = .;
+        run;
+        
+        /* get adf p-value from correct column */
+        %if %sysfunc(exist(_adf_&i)) %then %do;
+            data _temp_adf;
+                set _adf_&i;
+                /* adf typically has pValue or similar - take first non-missing */
+                if _n_ = 1 and not missing(pValue) then do;
+                    adf_pvalue = pValue;
+                    output;
+                end;
+                keep adf_pvalue;
+            run;
             
-            /* get adf p-value - usually the first lag with lowest p-value */
-            set _adf_&i;
-            if _n_ = 1;
-            adf_pvalue = prob;
-            keep variable adf_pvalue;
-        run;
+            data _temp_result;
+                merge _temp_result _temp_adf;
+            run;
+        %end;
         
-        /* add pp p-value */
-        data _temp_result;
-            merge _temp_result (in=a) _pp_&i (keep=prob rename=(prob=pp_pvalue));
-            if a;
-        run;
+        /* get pp p-value */
+        %if %sysfunc(exist(_pp_&i)) %then %do;
+            data _temp_pp;
+                set _pp_&i;
+                if _n_ = 1 and not missing(pValue) then do;
+                    pp_pvalue = pValue;
+                    output;
+                end;
+                keep pp_pvalue;
+            run;
+            
+            data _temp_result;
+                merge _temp_result _temp_pp;
+            run;
+        %end;
         
-        /* add kpss p-value */
-        data _temp_result;
-            merge _temp_result (in=a) _kpss_&i (keep=prob rename=(prob=kpss_pvalue));
-            if a;
-        run;
+        /* get kpss p-value */
+        %if %sysfunc(exist(_kpss_&i)) %then %do;
+            data _temp_kpss;
+                set _kpss_&i;
+                if _n_ = 1 and not missing(pValue) then do;
+                    kpss_pvalue = pValue;
+                    output;
+                end;
+                keep kpss_pvalue;
+            run;
+            
+            data _temp_result;
+                merge _temp_result _temp_kpss;
+            run;
+        %end;
         
         /* append to main results */
         data _test_results;
@@ -99,7 +141,7 @@ run;
         
         /* clean up temp datasets */
         proc datasets lib=work nolist;
-            delete _adf_&i _pp_&i _kpss_&i _temp_result;
+            delete _adf_&i _pp_&i _kpss_&i _temp_result _temp_adf _temp_pp _temp_kpss;
         quit;
         
     %end;
@@ -109,13 +151,36 @@ run;
     
 %end;
 
-/* create summary table with null hypotheses */
-data _summary_table;
-    set _test_results;
+/* check if we got any results */
+proc sql noprint;
+    select count(*) into :_nresults trimmed
+    from _test_results;
+quit;
+
+%put NOTE: found &_nresults variables that passed the filters;
+
+%if %eval(&_nresults = 0) %then %do;
+    %put WARNING: no variables passed the filters - check your variable types and unique counts;
     
-    /* format p-values nicely */
-    format adf_pvalue pp_pvalue kpss_pvalue 6.4;
-run;
+    /* create empty summary anyway */
+    data _summary_table;
+        length variable $32;
+        variable = "NO VARIABLES TESTED";
+        adf_pvalue = .;
+        pp_pvalue = .;
+        kpss_pvalue = .;
+        format adf_pvalue pp_pvalue kpss_pvalue 6.4;
+    run;
+%end;
+%else %do;
+    /* create summary table with null hypotheses */
+    data _summary_table;
+        set _test_results;
+        
+        /* format p-values nicely */
+        format adf_pvalue pp_pvalue kpss_pvalue 6.4;
+    run;
+%end;
 
 /* add header row with null hypotheses */
 data _summary_with_headers;
@@ -150,9 +215,9 @@ data _summary_with_headers;
     set _summary_table;
 run;
 
-/* print the summary table */
+/* print the summary table - fix literal ampersand */
 title "Stationarity Tests Summary - P-Values";
-title2 "ADF & PP: H0 = unit root (non-stationary) | KPSS: H0 = stationary";
+title2 "ADF && PP: H0 = unit root (non-stationary) | KPSS: H0 = stationary";
 proc print data=_summary_with_headers noobs;
     var variable adf_pvalue pp_pvalue kpss_pvalue;
     label variable="Variable"
@@ -165,9 +230,9 @@ title;
 /* interpretation note */
 data _null_;
     put "NOTE: Interpretation Guide:";
-    put "NOTE: ADF & PP tests - if p < 0.05, reject H0 (series is stationary)";
+    put "NOTE: ADF && PP tests - if p < 0.05, reject H0 (series is stationary)";
     put "NOTE: KPSS test - if p < 0.05, reject H0 (series is non-stationary)";
-    put "NOTE: For stationarity: want ADF & PP p-values < 0.05 AND KPSS p-value > 0.05";
+    put "NOTE: For stationarity: want ADF && PP p-values < 0.05 AND KPSS p-value > 0.05";
 run;
 
 /* clean up */
