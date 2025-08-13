@@ -1,9 +1,9 @@
 %macro stationarity_test(data=, var_list=);
 
-/* initialize results dataset to store p-values - use STOP not DELETE */
+/* initialize results dataset to store p-values - expanded structure */
 data _test_results;
-    length variable $32 adf_pvalue pp_pvalue kpss_pvalue 8;
-    stop;
+    length variable $32 test_type $20 specification $20 pvalue 8;
+    delete;
 run;
 
 /* robust library/member parsing */
@@ -76,115 +76,67 @@ run;
         run;
         title;
         
-        /* extract p-values - handle different column names per test */
+        /* extract p-values from the correct columns and create expanded summary */
         data _temp_result;
-            length variable $32;
+            length variable $32 test_type $20 specification $20;
             variable = "&var";
-            adf_pvalue = .;
-            pp_pvalue = .;
-            kpss_pvalue = .;
         run;
         
-        /* get adf p-value from "Pr < Tau" column - take first row */
+        /* get adf p-values from "Pr < Tau" column - all rows */
         %if %sysfunc(exist(_adf_&i)) %then %do;
-            /* debug: see what columns we have */
-            proc contents data=_adf_&i noprint out=_cols_adf; run;
-            proc sql noprint;
-                select name into :adf_cols separated by ' '
-                from _cols_adf;
-            quit;
-            %put NOTE: ADF columns: &adf_cols;
-            
             data _temp_adf;
                 set _adf_&i;
-                if _n_ = 1 then do;
-                    /* try different possible column names */
-                    adf_pvalue = .;
-                    array probcols _numeric_;
-                    do i = 1 to dim(probcols);
-                        if vname(probcols[i]) in ('PROBDF' 'PROBT' 'PVALUE' 'PROB') then do;
-                            if not missing(probcols[i]) then adf_pvalue = probcols[i];
-                        end;
-                    end;
-                    output;
-                end;
-                keep adf_pvalue;
+                length variable $32 test_type $20 specification $20;
+                variable = "&var";
+                test_type = "ADF";
+                specification = trim(type) || "_Lag" || put(lags, 1.);
+                pvalue = probdf;  /* use Pr < Tau column */
+                keep variable test_type specification pvalue;
             run;
             
             data _temp_result;
-                merge _temp_result _temp_adf;
+                set _temp_result _temp_adf;
             run;
-            
-            proc datasets lib=work nolist; delete _cols_adf; quit;
         %end;
         
-        /* get pp p-value from "Pr < Tau" column */
+        /* get pp p-values from "Pr < Tau" column */
         %if %sysfunc(exist(_pp_&i)) %then %do;
-            /* debug: see what columns we have */
-            proc contents data=_pp_&i noprint out=_cols_pp; run;
-            proc sql noprint;
-                select name into :pp_cols separated by ' '
-                from _cols_pp;
-            quit;
-            %put NOTE: PP columns: &pp_cols;
-            
             data _temp_pp;
                 set _pp_&i;
-                if _n_ = 1 then do;
-                    pp_pvalue = .;
-                    array probcols _numeric_;
-                    do i = 1 to dim(probcols);
-                        if vname(probcols[i]) in ('PROBDF' 'PROBT' 'PVALUE' 'PROB') then do;
-                            if not missing(probcols[i]) then pp_pvalue = probcols[i];
-                        end;
-                    end;
-                    output;
-                end;
-                keep pp_pvalue;
+                length variable $32 test_type $20 specification $20;
+                variable = "&var";
+                test_type = "PP";
+                specification = trim(type);
+                pvalue = probdf;  /* use Pr < Tau column */
+                keep variable test_type specification pvalue;
             run;
             
             data _temp_result;
-                merge _temp_result _temp_pp;
+                set _temp_result _temp_pp;
             run;
-            
-            proc datasets lib=work nolist; delete _cols_pp; quit;
         %end;
         
-        /* get kpss p-value from "Pr > Eta" column */
+        /* get kpss p-values from "Pr > Eta" column */
         %if %sysfunc(exist(_kpss_&i)) %then %do;
-            /* debug: see what columns we have */
-            proc contents data=_kpss_&i noprint out=_cols_kpss; run;
-            proc sql noprint;
-                select name into :kpss_cols separated by ' '
-                from _cols_kpss;
-            quit;
-            %put NOTE: KPSS columns: &kpss_cols;
-            
             data _temp_kpss;
                 set _kpss_&i;
-                if _n_ = 1 then do;
-                    kpss_pvalue = .;
-                    array probcols _numeric_;
-                    do i = 1 to dim(probcols);
-                        if vname(probcols[i]) in ('PROBDF' 'PROBT' 'PVALUE' 'PROB') then do;
-                            if not missing(probcols[i]) then kpss_pvalue = probcols[i];
-                        end;
-                    end;
-                    output;
-                end;
-                keep kpss_pvalue;
+                length variable $32 test_type $20 specification $20;
+                variable = "&var";
+                test_type = "KPSS";
+                specification = trim(type);
+                pvalue = probdf;  /* use Pr > Eta column */
+                keep variable test_type specification pvalue;
             run;
             
             data _temp_result;
-                merge _temp_result _temp_kpss;
+                set _temp_result _temp_kpss;
             run;
-            
-            proc datasets lib=work nolist; delete _cols_kpss; quit;
         %end;
         
         /* append to main results */
         data _test_results;
             set _test_results _temp_result;
+            where not missing(pvalue);  /* only keep rows with actual p-values */
         run;
         
         /* clean up temp datasets */
@@ -212,66 +164,33 @@ quit;
     
     /* create empty summary anyway */
     data _summary_table;
-        length variable $32;
+        length variable $32 test_type $20 specification $20;
         variable = "NO VARIABLES TESTED";
-        adf_pvalue = .;
-        pp_pvalue = .;
-        kpss_pvalue = .;
-        format adf_pvalue pp_pvalue kpss_pvalue 6.4;
+        test_type = "";
+        specification = "";
+        pvalue = .;
+        format pvalue 6.4;
     run;
 %end;
 %else %do;
-    /* create summary table with null hypotheses */
+    /* create summary table */
     data _summary_table;
         set _test_results;
         
         /* format p-values nicely */
-        format adf_pvalue pp_pvalue kpss_pvalue 6.4;
+        format pvalue 6.4;
     run;
 %end;
 
-/* add header row with null hypotheses */
-data _summary_with_headers;
-    length variable $32;
-    
-    /* header row */
-    variable = "NULL HYPOTHESIS:";
-    adf_pvalue = .;
-    pp_pvalue = .;  
-    kpss_pvalue = .;
-    output;
-    
-    variable = "Series has unit root";
-    adf_pvalue = .;
-    pp_pvalue = .;
-    kpss_pvalue = .;
-    output;
-    
-    variable = "(non-stationary)";
-    adf_pvalue = .;
-    pp_pvalue = .;
-    kpss_pvalue = .;
-    output;
-    
-    variable = " ";
-    adf_pvalue = .;
-    pp_pvalue = .;
-    kpss_pvalue = .;
-    output;
-    
-    /* add the actual results */
-    set _summary_table;
-run;
-
-/* print the summary table - fix literal ampersand */
-title "Stationarity Tests Summary - P-Values";
+/* print the expanded summary table */
+title "Stationarity Tests Summary - Expanded Results";
 title2 "ADF && PP: H0 = unit root (non-stationary) | KPSS: H0 = stationary";
-proc print data=_summary_with_headers noobs;
-    var variable adf_pvalue pp_pvalue kpss_pvalue;
+proc print data=_summary_table noobs;
+    var variable test_type specification pvalue;
     label variable="Variable"
-          adf_pvalue="ADF p-value" 
-          pp_pvalue="PP p-value"
-          kpss_pvalue="KPSS p-value";
+          test_type="Test Type"
+          specification="Specification"
+          pvalue="P-Value";
 run;
 title;
 
@@ -285,7 +204,7 @@ run;
 
 /* clean up */
 proc datasets lib=work nolist;
-    delete _test_results _summary_table _summary_with_headers;
+    delete _test_results _summary_table;
 quit;
 
 %mend;
