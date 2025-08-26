@@ -1,20 +1,25 @@
-/* Step 1: Get first 20 unique loan numbers */
-proc sql;
-   create table first_20_loans as
-   select distinct loan_number
-   from your_dataset_name;
-quit;
+import pandas as pd
 
-data first_20_loans;
-   set first_20_loans;
-   if _n_ <= 20;
-run;
+# make sure dates are datetime
+exploded_data['def_date'] = pd.to_datetime(exploded_data['def_date'])
+exploded_data['month_date'] = pd.to_datetime(exploded_data['month_date'])  # adjust column name as needed
 
-/* Step 2: Get all rows for those 20 loans */
-proc sql;
-   create table subset_data as
-   select a.*
-   from your_dataset_name a
-   inner join first_20_loans b
-   on a.loan_number = b.loan_number;
-quit;
+# exact month calculation
+exploded_data['months_since_default'] = (
+    exploded_data['month_date'].dt.to_period('M') - 
+    exploded_data['def_date'].dt.to_period('M')
+).apply(attrgetter('n'))
+
+# keep only 36 months post-default
+post_default_data = exploded_data[
+    (exploded_data['months_since_default'] >= 0) & 
+    (exploded_data['months_since_default'] <= 36)
+].copy()
+
+# group by loan and sum charged off amounts
+lgd_data = post_default_data.groupby('loan_number').agg({
+    'charged_off_amt_ltd': 'sum'
+}).reset_index()
+
+# rename column
+lgd_data.rename(columns={'charged_off_amt_ltd': 'lgd_36m'}, inplace=True)
