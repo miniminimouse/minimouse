@@ -1,25 +1,15 @@
-import pandas as pd
+def paginate_df(df, page_size=500):
+    total_pages = len(df) // page_size + 1
+    
+    def show_page(page=0):
+        start_idx = page * page_size
+        end_idx = min((page + 1) * page_size, len(df))
+        print(f"Page {page+1} of {total_pages} (rows {start_idx} to {end_idx-1})")
+        display(df.iloc[start_idx:end_idx])
+    
+    return show_page
 
-# make sure dates are datetime
-exploded_data['def_date'] = pd.to_datetime(exploded_data['def_date'])
-exploded_data['month_date'] = pd.to_datetime(exploded_data['month_date'])  # adjust column name as needed
-
-# exact month calculation
-exploded_data['months_since_default'] = (
-    exploded_data['month_date'].dt.to_period('M') - 
-    exploded_data['def_date'].dt.to_period('M')
-).apply(attrgetter('n'))
-
-# keep only 36 months post-default
-post_default_data = exploded_data[
-    (exploded_data['months_since_default'] >= 0) & 
-    (exploded_data['months_since_default'] <= 36)
-].copy()
-
-# group by loan and sum charged off amounts
-lgd_data = post_default_data.groupby('loan_number').agg({
-    'charged_off_amt_ltd': 'sum'
-}).reset_index()
-
-# rename column
-lgd_data.rename(columns={'charged_off_amt_ltd': 'lgd_36m'}, inplace=True)
+# use it
+viewer = paginate_df(exploded_data)
+viewer(0)  # first page
+viewer(10)  # page 11, etc
