@@ -78,73 +78,62 @@ data pred_by_segments;
     format lgd_pred p_1 p_2 percent10.4;
 run;
 
-/* Get the most recent date and calculate cutoff for N months */
-proc sql noprint;
-    select max(date) into :max_date
-    from pred_by_segments;
-quit;
-
-data _null_;
-    max_date = &max_date;
-    cutoff_date = intnx('month', max_date, -&n_months + 1, 'beginning');
-    call symputx('cutoff_date', cutoff_date);
-    call symputx('max_date_fmt', put(max_date, date9.));
-    call symputx('cutoff_date_fmt', put(cutoff_date, date9.));
-run;
-
-%put NOTE: Including data from &cutoff_date_fmt to &max_date_fmt (&n_months months);
-
-/* Filter data to include only the most recent N months */
-data pred_by_segments_filtered;
-    set pred_by_segments;
-    where date >= &cutoff_date;
-run;
-
-/* Group 1: Mean LGD by date across all segments (filtered to N months) */
+/* Group 1: Mean LGD by date across all segments */
 proc sql;
-    create table lgd_by_date as
+    create table lgd_by_date_all as
     select 
         date,
         mean(lgd_pred) as lgd_pred format=percent10.4,
         count(*) as n_loans
-    from pred_by_segments_filtered
+    from pred_by_segments
     where not missing(lgd_pred)
     group by date
     order by date;
 quit;
 
-/* Group 2: Mean LGD by segment and date (filtered to N months) */
+/* Keep only first N months */
+data lgd_by_date;
+    set lgd_by_date_all (obs=&n_months);
+run;
+
+/* Group 2: Mean LGD by segment and date */
 proc sql;
-    create table lgd_by_segment_date as
+    create table lgd_by_segment_date_all as
     select 
         segment,
         date,
         mean(lgd_pred) as lgd_pred format=percent10.4,
         count(*) as n_loans
-    from pred_by_segments_filtered
+    from pred_by_segments
     where not missing(lgd_pred)
     group by segment, date
     order by segment, date;
 quit;
 
+/* Keep only first N months for each segment */
+data lgd_by_segment_date;
+    set lgd_by_segment_date_all;
+    by segment;
+    if first.segment then month_count = 0;
+    month_count + 1;
+    if month_count <= &n_months;
+    drop month_count;
+run;
+
 /* Create time series plot for overall LGD predictions (Group 1 - 1 plot) */
 ods graphics / reset width=12in height=6in;
 
 title "CCAR LGD Predictions - Overall Portfolio Time Series";
-title2 "Combined Stage 1 and Stage 2 Model Output (Most Recent &n_months Months)";
-footnote j=l "Period: &cutoff_date_fmt to &max_date_fmt";
+title2 "Combined Stage 1 and Stage 2 Model Output (First &n_months Months)";
 
 proc sgplot data=lgd_by_date;
     series x=date y=lgd_pred / 
         lineattrs=(thickness=2 color=navy) 
         markers markerattrs=(symbol=circlefilled color=navy size=8);
-    xaxis label="Date" grid 
-          values=(&cutoff_date to &max_date by month)
-          fitpolicy=rotatethin;
+    xaxis label="Date" grid;
     yaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.1);
     format date monyy7.;
 run;
-footnote;
 
 /* Create panel plot for segment-level time series (Group 2 - 4 plots for each segment) */
 title "CCAR LGD Predictions by Segment - Time Series Analysis";
@@ -155,9 +144,7 @@ proc sgpanel data=lgd_by_segment_date;
     series x=date y=lgd_pred / 
         lineattrs=(thickness=2 color=blue) 
         markers markerattrs=(symbol=circlefilled color=blue);
-    colaxis label="Date" grid 
-            values=(&cutoff_date to &max_date by quarter)
-            fitpolicy=rotatethin;
+    colaxis label="Date" grid;
     rowaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.2);
     format date qtr.;
 run;
@@ -166,24 +153,15 @@ run;
 %macro segment_plots(seg_name, seg_label);
     title "CCAR LGD Predictions - &seg_label";
     title2 "Mean LGD Time Series (&n_months Month CCAR Horizon)";
-    footnote j=l "Period: &cutoff_date_fmt to &max_date_fmt";
     
     proc sgplot data=lgd_by_segment_date(where=(segment="&seg_name"));
         series x=date y=lgd_pred / 
             lineattrs=(thickness=2 color=blue) 
             markers markerattrs=(symbol=circlefilled color=blue size=8);
-        xaxis label="Date" grid 
-              values=(&cutoff_date to &max_date by month)
-              fitpolicy=rotatethin;
+        xaxis label="Date" grid;
         yaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.1);
         format date monyy7.;
-        /* Add reference line for quarter boundaries */
-        %do q = 0 %to 8;
-            %let qtr_date = %sysfunc(intnx(quarter, &cutoff_date, &q));
-            refline &qtr_date / axis=x lineattrs=(pattern=dot color=gray) transparency=0.7;
-        %end;
     run;
-    footnote;
 %mend segment_plots;
 
 /* Generate individual plots for each segment */
@@ -192,37 +170,3 @@ run;
 %segment_plots(del3, Delinquency Bucket 3 - 61 to 90 DPD);
 %segment_plots(arm, Adjustable Rate Mortgages);
 %segment_plots(del0_fix, Current Fixed Rate Mortgages);
-
-/* Create summary table for the CCAR horizon */
-title "CCAR LGD Summary Statistics - &n_months Month Horizon";
-proc tabulate data=pred_by_segments_filtered;
-    class segment;
-    var lgd_pred;
-    table segment='Segment' all='Overall',
-          lgd_pred='Mean LGD' * (n='N Loans' mean='Mean'*f=percent10.4);
-    where not missing(lgd_pred);
-run;
-
-/* Print quarter-level aggregation for CCAR reporting */
-data lgd_by_quarter;
-    set lgd_by_date;
-    quarter = qtr(date);
-    year = year(date);
-    qtr_label = cat(year, 'Q', quarter);
-run;
-
-proc sql;
-    create table lgd_quarterly_summary as
-    select 
-        qtr_label,
-        mean(lgd_pred) as quarterly_lgd format=percent10.4,
-        sum(n_loans) as total_loans
-    from lgd_by_quarter
-    group by year, quarter, qtr_label
-    order by year, quarter;
-quit;
-
-title "CCAR Quarterly LGD Summary (9 Quarters)";
-proc print data=lgd_quarterly_summary noobs;
-    var qtr_label quarterly_lgd total_loans;
-run;
