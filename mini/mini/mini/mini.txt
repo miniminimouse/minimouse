@@ -1,15 +1,162 @@
-def paginate_df(df, page_size=500):
-    total_pages = len(df) // page_size + 1
+/* Define macro for cleaner segment processing */
+%macro process_segments(stage_num, date_var);
+    %let segments = del1 del2 del3 arm del0_fix;
     
-    def show_page(page=0):
-        start_idx = page * page_size
-        end_idx = min((page + 1) * page_size, len(df))
-        print(f"Page {page+1} of {total_pages} (rows {start_idx} to {end_idx-1})")
-        display(df.iloc[start_idx:end_idx])
+    %do i = 1 %to 5;
+        %let seg = %scan(&segments, &i);
+        
+        data stage_&stage_num._&seg;
+            set ccar_lgd.stage_&stage_num._&seg (keep=spst_loan_number &date_var);
+            segment = "&seg";
+            stage = &stage_num;
+        run;
+    %end;
     
-    return show_page
+    /* Stack all segments for the stage */
+    data stacked_stage_&stage_num;
+        set stage_&stage_num._del1
+            stage_&stage_num._del2
+            stage_&stage_num._del3
+            stage_&stage_num._arm
+            stage_&stage_num._del0_fix;
+    run;
+    
+    /* Sort for merging */
+    proc sort data=stacked_stage_&stage_num;
+        by spst_loan_number &date_var segment;
+    run;
+%mend process_segments;
 
-# use it
-viewer = paginate_df(exploded_data)
-viewer(0)  # first page
-viewer(10)  # page 11, etc
+/* Process Stage 1 and Stage 2 data */
+%process_segments(1, date_p_2);
+%process_segments(2, date_p_1);
+
+/* Join Stage 1 and Stage 2 on loan number and date */
+proc sql;
+    create table joined_stages as
+    select 
+        coalesce(a.spst_loan_number, b.spst_loan_number) as spst_loan_number,
+        coalesce(a.date_p_2, b.date_p_1) as date,
+        coalesce(a.segment, b.segment) as segment,
+        a.date_p_2 as p_1,
+        b.date_p_1 as p_2
+    from stacked_stage_1 a
+    full join stacked_stage_2 b
+    on a.spst_loan_number = b.spst_loan_number 
+    and a.date_p_2 = b.date_p_1
+    and a.segment = b.segment;
+quit;
+
+/* Calculate LGD predictions (p_1 * p_2) */
+data pred_by_segments;
+    set joined_stages;
+    /* Handle missing values appropriately for LGD calculation */
+    if not missing(p_1) and not missing(p_2) then
+        lgd_pred = p_1 * p_2;
+    else if not missing(p_1) and missing(p_2) then
+        lgd_pred = p_1;  /* Stage 1 only */
+    else if missing(p_1) and not missing(p_2) then
+        lgd_pred = p_2;  /* Stage 2 only */
+    else
+        lgd_pred = .;
+    
+    format date date9.;
+    format lgd_pred percent10.2;
+run;
+
+/* Group 1: Aggregate LGD predictions by date across all segments */
+proc sql;
+    create table lgd_by_date as
+    select 
+        date,
+        mean(lgd_pred) as lgd_pred_mean format=percent10.2,
+        median(lgd_pred) as lgd_pred_median format=percent10.2,
+        std(lgd_pred) as lgd_pred_std format=percent10.2,
+        min(lgd_pred) as lgd_pred_min format=percent10.2,
+        max(lgd_pred) as lgd_pred_max format=percent10.2,
+        count(*) as n_loans
+    from pred_by_segments
+    where not missing(lgd_pred)
+    group by date
+    order by date;
+quit;
+
+/* Group 2: Aggregate LGD predictions by segment and date */
+proc sql;
+    create table lgd_by_segment_date as
+    select 
+        segment,
+        date,
+        mean(lgd_pred) as lgd_pred_mean format=percent10.2,
+        median(lgd_pred) as lgd_pred_median format=percent10.2,
+        std(lgd_pred) as lgd_pred_std format=percent10.2,
+        p25(lgd_pred) as lgd_pred_p25 format=percent10.2,
+        p75(lgd_pred) as lgd_pred_p75 format=percent10.2,
+        count(*) as n_loans
+    from pred_by_segments
+    where not missing(lgd_pred)
+    group by segment, date
+    order by segment, date;
+quit;
+
+/* Create time series plot for overall LGD predictions (Group 1) */
+title "CCAR LGD Predictions - Overall Portfolio Time Series";
+title2 "Combined Stage 1 and Stage 2 Model Output";
+proc sgplot data=lgd_by_date;
+    series x=date y=lgd_pred_mean / 
+        lineattrs=(thickness=2 color=navy) 
+        markers markerattrs=(symbol=circlefilled color=navy);
+    band x=date upper=lgd_pred_max lower=lgd_pred_min / 
+        transparency=0.7 fillattrs=(color=lightblue);
+    xaxis label="Date" grid;
+    yaxis label="LGD Prediction (%)" grid values=(0 to 1 by 0.1);
+    refline 0.4 / axis=y lineattrs=(pattern=dash color=red) 
+        label="Historical Average" labelpos=max;
+    format date monyy7.;
+run;
+
+/* Create panel plot for segment-level time series (Group 2) */
+title "CCAR LGD Predictions by Segment - Time Series Analysis";
+title2 "Delinquency Buckets and Product Types";
+proc sgpanel data=lgd_by_segment_date;
+    panelby segment / columns=2 rows=3 uniscale=column;
+    series x=date y=lgd_pred_mean / 
+        lineattrs=(thickness=2) 
+        markers markerattrs=(symbol=circlefilled);
+    band x=date upper=lgd_pred_p75 lower=lgd_pred_p25 / 
+        transparency=0.5;
+    colaxis label="Date" grid;
+    rowaxis label="LGD Prediction (%)" grid values=(0 to 1 by 0.2);
+    format date monyy7.;
+run;
+
+/* Create individual plots for each segment with more detail */
+%macro segment_plots(seg_name);
+    title "CCAR LGD Predictions - Segment: %upcase(&seg_name)";
+    title2 "Mean, Median, and Confidence Intervals";
+    
+    proc sgplot data=lgd_by_segment_date(where=(segment="&seg_name"));
+        series x=date y=lgd_pred_mean / 
+            lineattrs=(thickness=2 color=blue) 
+            legendlabel="Mean LGD"
+            markers markerattrs=(symbol=circle color=blue);
+        series x=date y=lgd_pred_median / 
+            lineattrs=(thickness=2 color=green pattern=dash) 
+            legendlabel="Median LGD"
+            markers markerattrs=(symbol=square color=green);
+        band x=date upper=lgd_pred_p75 lower=lgd_pred_p25 / 
+            transparency=0.6 fillattrs=(color=lightgray)
+            legendlabel="IQR (P25-P75)";
+        xaxis label="Date" grid;
+        yaxis label="LGD Prediction (%)" grid values=(0 to 1 by 0.1);
+        legend location=inside position=topleft;
+        format date monyy7.;
+    run;
+%mend segment_plots;
+
+/* Generate individual plots for each segment */
+%segment_plots(del1);
+%segment_plots(del2);
+%segment_plots(del3);
+%segment_plots(arm);
+%segment_plots(del0_fix);
