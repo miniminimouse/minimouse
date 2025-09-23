@@ -1,172 +1,217 @@
 /* Set parameter for number of months to include (9 quarters = 27 months for CCAR) */
 %let n_months = 27;  /* Adjust this value to include more/fewer months */
 
-/* Define macro for cleaner segment processing */
-%macro process_segments(stage_num, pred_var);
-    %let segments = del1 del2 del3 arm del0_fix;
+/* Define macro to process each dataset */
+%macro process_scenario_data();
+    %let segments = dq0_a dq0_f dq1 dq2 dq3;
+    %let scenarios = base sa;
     
+    /* Loop through each segment and scenario combination */
     %do i = 1 %to 5;
         %let seg = %scan(&segments, &i);
         
-        /* Determine correct library based on segment */
-        %if &seg = del0_fix %then %do;
-            %let lib = ccar_mrm;
+        %do j = 1 %to 2;
+            %let scen = %scan(&scenarios, &j);
+            
+            /* Read each dataset and standardize structure */
+            data temp_&seg._&scen;
+                set ccar_el.loan_loss_&seg._&scen (keep=loan_number date lgd_&scen);
+                segment = "&seg";
+                scenario = "&scen";
+                rename lgd_&scen = lgd;
+            run;
         %end;
-        %else %do;
-            %let lib = ccar_lgd;
-        %end;
-        
-        data stage_&stage_num._&seg;
-            set &lib..stage_&stage_num._&seg (keep=spst_loan_number date &pred_var);
-            segment = "&seg";
-            stage = &stage_num;
-            rename &pred_var = p_&stage_num;  /* Rename to p_1 or p_2 */
-        run;
     %end;
     
-    /* Stack all segments for the stage */
-    data stacked_stage_&stage_num;
-        set stage_&stage_num._del1
-            stage_&stage_num._del2
-            stage_&stage_num._del3
-            stage_&stage_num._arm
-            stage_&stage_num._del0_fix;
+    /* Stack all datasets together */
+    data stacked_scenarios;
+        set temp_dq0_a_base
+            temp_dq0_a_sa
+            temp_dq0_f_base
+            temp_dq0_f_sa
+            temp_dq1_base
+            temp_dq1_sa
+            temp_dq2_base
+            temp_dq2_sa
+            temp_dq3_base
+            temp_dq3_sa;
+        format date date9.;
+        format lgd percent10.4;
     run;
     
-    /* Sort for merging */
-    proc sort data=stacked_stage_&stage_num;
-        by spst_loan_number date segment;
+    /* Sort for analysis */
+    proc sort data=stacked_scenarios;
+        by scenario segment date loan_number;
     run;
-%mend process_segments;
+%mend process_scenario_data;
 
-/* Process Stage 1 and Stage 2 data */
-%process_segments(1, p_2);  /* Stage 1 has p_2 variable */
-%process_segments(2, p_1);  /* Stage 2 has p_1 variable */
+/* Execute the data processing */
+%process_scenario_data();
 
-/* Join Stage 1 and Stage 2 on loan number, date, and segment */
+/* Group 1: Mean LGD by date and scenario across all segments */
 proc sql;
-    create table joined_stages as
+    create table lgd_by_date_scenario_all as
     select 
-        coalesce(a.spst_loan_number, b.spst_loan_number) as spst_loan_number,
-        coalesce(a.date, b.date) as date,
-        coalesce(a.segment, b.segment) as segment,
-        a.p_1 as p_1,  /* From Stage 1 (was p_2 in original) */
-        b.p_2 as p_2   /* From Stage 2 (was p_1 in original) */
-    from stacked_stage_1 a
-    full join stacked_stage_2 b
-    on a.spst_loan_number = b.spst_loan_number 
-    and a.date = b.date
-    and a.segment = b.segment
-    order by segment, date, spst_loan_number;
-quit;
-
-/* Calculate LGD predictions (p_1 * p_2) */
-data pred_by_segments;
-    set joined_stages;
-    
-    /* Calculate combined LGD prediction */
-    if not missing(p_1) and not missing(p_2) then
-        lgd_pred = p_1 * p_2;
-    else if not missing(p_1) and missing(p_2) then
-        lgd_pred = p_1;  /* Stage 1 only */
-    else if missing(p_1) and not missing(p_2) then
-        lgd_pred = p_2;  /* Stage 2 only */
-    else
-        lgd_pred = .;
-    
-    format date date9.;
-    format lgd_pred p_1 p_2 percent10.4;
-run;
-
-/* Group 1: Mean LGD by date across all segments */
-proc sql;
-    create table lgd_by_date_all as
-    select 
+        scenario,
         date,
-        mean(lgd_pred) as lgd_pred format=percent10.4,
+        mean(lgd) as lgd_mean format=percent10.4,
         count(*) as n_loans
-    from pred_by_segments
-    where not missing(lgd_pred)
-    group by date
-    order by date;
+    from stacked_scenarios
+    where not missing(lgd)
+    group by scenario, date
+    order by scenario, date;
 quit;
 
 /* Keep only first N months */
-data lgd_by_date;
-    set lgd_by_date_all (obs=&n_months);
-run;
-
-/* Group 2: Mean LGD by segment and date */
-proc sql;
-    create table lgd_by_segment_date_all as
-    select 
-        segment,
-        date,
-        mean(lgd_pred) as lgd_pred format=percent10.4,
-        count(*) as n_loans
-    from pred_by_segments
-    where not missing(lgd_pred)
-    group by segment, date
-    order by segment, date;
-quit;
-
-/* Keep only first N months for each segment */
-data lgd_by_segment_date;
-    set lgd_by_segment_date_all;
-    by segment;
-    if first.segment then month_count = 0;
+data lgd_by_date_scenario;
+    set lgd_by_date_scenario_all;
+    by scenario;
+    if first.scenario then month_count = 0;
     month_count + 1;
     if month_count <= &n_months;
     drop month_count;
 run;
 
-/* Create time series plot for overall LGD predictions (Group 1 - 1 plot) */
+/* Group 2: Mean LGD by segment, date, and scenario */
+proc sql;
+    create table lgd_by_segment_scenario_all as
+    select 
+        segment,
+        scenario,
+        date,
+        mean(lgd) as lgd_mean format=percent10.4,
+        count(*) as n_loans
+    from stacked_scenarios
+    where not missing(lgd)
+    group by segment, scenario, date
+    order by segment, scenario, date;
+quit;
+
+/* Keep only first N months for each segment-scenario combination */
+data lgd_by_segment_scenario;
+    set lgd_by_segment_scenario_all;
+    by segment scenario;
+    if first.scenario then month_count = 0;
+    month_count + 1;
+    if month_count <= &n_months;
+    drop month_count;
+run;
+
+/* Create time series plot comparing scenarios - Overall Portfolio (Group 1 - 1 plot) */
 ods graphics / reset width=12in height=6in;
 
-title "CCAR LGD Predictions - Overall Portfolio Time Series";
-title2 "Combined Stage 1 and Stage 2 Model Output (First &n_months Months)";
+title "CCAR Expected Loss Scenarios - Overall Portfolio Comparison";
+title2 "Base vs Severe Adverse Scenarios (First &n_months Months)";
 
-proc sgplot data=lgd_by_date;
-    series x=date y=lgd_pred / 
-        lineattrs=(thickness=2 color=navy) 
-        markers markerattrs=(symbol=circlefilled color=navy size=8);
+proc sgplot data=lgd_by_date_scenario;
+    series x=date y=lgd_mean / 
+        group=scenario
+        lineattrs=(thickness=2) 
+        markers markerattrs=(size=8);
+    styleattrs datacontrastcolors=(darkgreen darkred);
     xaxis label="Date" grid;
-    yaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.1);
+    yaxis label="Mean LGD" grid values=(0 to 1 by 0.1);
+    keylegend / location=inside position=topleft title="Scenario";
     format date monyy7.;
 run;
 
-/* Create panel plot for segment-level time series (Group 2 - 4 plots for each segment) */
-title "CCAR LGD Predictions by Segment - Time Series Analysis";
-title2 "Mean LGD by Delinquency Buckets and Product Types (&n_months Month Window)";
+/* Create panel plot by segment showing both scenarios */
+title "CCAR Expected Loss by Segment - Scenario Comparison";
+title2 "Base vs Severe Adverse (&n_months Month Window)";
 
-proc sgpanel data=lgd_by_segment_date;
+proc sgpanel data=lgd_by_segment_scenario;
     panelby segment / columns=2 rows=3 uniscale=column novarname;
-    series x=date y=lgd_pred / 
-        lineattrs=(thickness=2 color=blue) 
-        markers markerattrs=(symbol=circlefilled color=blue);
+    series x=date y=lgd_mean / 
+        group=scenario
+        lineattrs=(thickness=2) 
+        markers;
+    styleattrs datacontrastcolors=(darkgreen darkred);
     colaxis label="Date" grid;
-    rowaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.2);
+    rowaxis label="Mean LGD" grid values=(0 to 1 by 0.2);
     format date qtr.;
 run;
 
-/* Create individual detailed plots for each segment */
-%macro segment_plots(seg_name, seg_label);
-    title "CCAR LGD Predictions - &seg_label";
-    title2 "Mean LGD Time Series (&n_months Month CCAR Horizon)";
+/* Create individual segment plots with scenario comparison */
+%macro segment_scenario_plots(seg_name, seg_label);
+    title "CCAR Expected Loss - &seg_label";
+    title2 "Base vs Severe Adverse Scenario Comparison (&n_months Month CCAR Horizon)";
     
-    proc sgplot data=lgd_by_segment_date(where=(segment="&seg_name"));
-        series x=date y=lgd_pred / 
-            lineattrs=(thickness=2 color=blue) 
-            markers markerattrs=(symbol=circlefilled color=blue size=8);
+    proc sgplot data=lgd_by_segment_scenario(where=(segment="&seg_name"));
+        series x=date y=lgd_mean / 
+            group=scenario
+            lineattrs=(thickness=2) 
+            markers markerattrs=(size=8);
+        styleattrs datacontrastcolors=(darkgreen darkred);
         xaxis label="Date" grid;
-        yaxis label="Mean LGD Prediction" grid values=(0 to 1 by 0.1);
+        yaxis label="Mean LGD" grid values=(0 to 1 by 0.1);
+        keylegend / location=inside position=topleft title="Scenario";
         format date monyy7.;
     run;
-%mend segment_plots;
+%mend segment_scenario_plots;
 
 /* Generate individual plots for each segment */
-%segment_plots(del1, Delinquency Bucket 1 - Current to 30 DPD);
-%segment_plots(del2, Delinquency Bucket 2 - 31 to 60 DPD);
-%segment_plots(del3, Delinquency Bucket 3 - 61 to 90 DPD);
-%segment_plots(arm, Adjustable Rate Mortgages);
-%segment_plots(del0_fix, Current Fixed Rate Mortgages);
+%segment_scenario_plots(dq0_a, Delinquency Bucket 0 - ARM);
+%segment_scenario_plots(dq0_f, Delinquency Bucket 0 - Fixed);
+%segment_scenario_plots(dq1, Delinquency Bucket 1 - 30 DPD);
+%segment_scenario_plots(dq2, Delinquency Bucket 2 - 60 DPD);
+%segment_scenario_plots(dq3, Delinquency Bucket 3 - 90 DPD);
+
+/* Create scenario impact analysis - calculate difference between SA and Base */
+proc sql;
+    create table scenario_impact as
+    select 
+        b.segment,
+        b.date,
+        b.lgd_mean as base_lgd format=percent10.4,
+        s.lgd_mean as sa_lgd format=percent10.4,
+        (s.lgd_mean - b.lgd_mean) as lgd_increase format=percent10.4,
+        case when b.lgd_mean > 0 then (s.lgd_mean - b.lgd_mean) / b.lgd_mean 
+             else . end as pct_increase format=percent10.2
+    from lgd_by_segment_scenario(where=(scenario='base')) as b
+    inner join lgd_by_segment_scenario(where=(scenario='sa')) as s
+    on b.segment = s.segment and b.date = s.date
+    order by segment, date;
+quit;
+
+/* Plot scenario impact by segment */
+title "CCAR Scenario Impact Analysis - SA vs Base Increase";
+title2 "Absolute LGD Increase by Segment";
+
+proc sgpanel data=scenario_impact;
+    panelby segment / columns=2 rows=3 uniscale=column novarname;
+    series x=date y=lgd_increase / 
+        lineattrs=(thickness=2 color=darkred) 
+        markers markerattrs=(symbol=circlefilled color=darkred);
+    colaxis label="Date" grid;
+    rowaxis label="LGD Increase (SA - Base)" grid;
+    refline 0 / axis=y lineattrs=(pattern=solid color=black);
+    format date qtr.;
+run;
+
+/* Summary statistics comparing scenarios */
+title "CCAR Scenario Comparison - Summary Statistics";
+proc tabulate data=lgd_by_segment_scenario;
+    class segment scenario;
+    var lgd_mean;
+    table segment='Segment' all='Overall',
+          scenario='Scenario' * lgd_mean='Mean LGD' * 
+          (mean='Average'*f=percent10.4);
+run;
+
+/* Create overall scenario comparison without segment breakdown */
+proc sql;
+    create table overall_scenario_summary as
+    select 
+        scenario,
+        mean(lgd_mean) as avg_lgd format=percent10.4,
+        min(lgd_mean) as min_lgd format=percent10.4,
+        max(lgd_mean) as max_lgd format=percent10.4,
+        std(lgd_mean) as std_lgd format=percent10.4
+    from lgd_by_date_scenario
+    group by scenario;
+quit;
+
+title "CCAR Overall Scenario Statistics";
+proc print data=overall_scenario_summary noobs;
+    var scenario avg_lgd min_lgd max_lgd std_lgd;
+run;
